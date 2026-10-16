@@ -1,16 +1,16 @@
-# 🛠️ Risoluzione Problemi (Troubleshooting) — M.A.R.
+#️ Risoluzione Problemi (Troubleshooting) — M.A.R.
 
 Guida alla risoluzione dei problemi più comuni relativi a fotocamere stereo, permessi hardware, modelli YOLO e prestazioni.
 
 ---
 
-## 📷 1. Problemi con la Stereocamera
+## 1. Problemi con la Stereocamera
 
-### Sintomo: La telecamera non viene rilevata o fallisce l'apertura
+###Sintomo: La telecamera non viene rilevata o fallisce l'apertura
 
-#### Su macOS:
+####Su macOS:
 1. **Permessi di Sicurezza e Privacy**:
-   - Vai in *Impostazioni di Sistema* ➔ *Privacy e Sicurezza* ➔ *Fotocamera*.
+   - Vai in *Impostazioni di Sistema* -> *Privacy e Sicurezza* -> *Fotocamera*.
    - Verifica che l'applicazione Terminale (o l'IDE in uso) sia abilitata.
 2. **Conflitto di Connessione**:
    - Assicurati che altre applicazioni (FaceTime, Zoom, OBS, browser) non stiano occupando il dispositivo video.
@@ -19,7 +19,7 @@ Guida alla risoluzione dei problemi più comuni relativi a fotocamere stereo, pe
    system_profiler SPCameraDataType
    ```
 
-#### Su Linux / Raspberry Pi:
+####Su Linux / Raspberry Pi:
 1. **Verifica Nodi Video**:
    ```bash
    ls -la /dev/video*
@@ -39,9 +39,9 @@ Guida alla risoluzione dei problemi più comuni relativi a fotocamere stereo, pe
 
 ---
 
-## 🔌 2. Problemi Seriale con Arduino
+## 2. Problemi Seriale con Arduino
 
-### Sintomo: Errore "Permission denied" su `/dev/ttyACM0` o `/dev/ttyUSB0`
+###Sintomo: Errore "Permission denied" su `/dev/ttyACM0` o `/dev/ttyUSB0`
 
 Aggiungi il tuo utente al gruppo `dialout`:
 ```bash
@@ -49,7 +49,7 @@ sudo usermod -a -G dialout $USER
 ```
 Effettua il log out e rientra nella sessione affinché i permessi diventino attivi.
 
-### Sintomo: Porta seriale non trovata automaticamente
+###Sintomo: Porta seriale non trovata automaticamente
 Specifica esplicitamente la porta con il flag `--serial-port`:
 ```bash
 python3 main.py --serial-port /dev/cu.usbmodem14101
@@ -62,9 +62,9 @@ python3 main.py --no-arduino
 
 ---
 
-## ⚡ 3. Ottimizzazione Prestazioni e Frame Rate (FPS)
+## 3. Ottimizzazione Prestazioni e Frame Rate (FPS)
 
-### Sintomo: FPS bassi su Raspberry Pi 5 o 4
+###Sintomo: FPS bassi su Raspberry Pi 5 o 4
 1. **Scelta del Modello YOLO**:
    - Usa **`yolov8n.pt`** (Nano): è il modello raccomandato con l'ottimo compromesso velocità/accuratezza per dispositivi embedded ARM (~15-30 FPS).
    - Evita modelli `x` (extra-large come `yolo26x.pt` o `yolov8x.pt`) in tempo reale su CPU, in quanto pensati per GPU workstation dedicate.
@@ -81,9 +81,9 @@ python3 main.py --no-arduino
 
 ---
 
-## 🌐 4. Connessione con la Dashboard Next.js
+## 4. Connessione con la Dashboard Next.js
 
-### Sintomo: I video non compaiono in `dashboard-mar-quadrupede`
+###Sintomo: I video non compaiono in `dashboard-mar-quadrupede`
 1. Assicurati che lo script di stereovisione sia in esecuzione sulla porta `8443`.
 2. Apri `http://localhost:8443/` nel browser: dovresti vedere la griglia di monitoraggio con i 4 stream.
 3. Se accedi da un altro PC/tablet via rete locale o Tailscale:

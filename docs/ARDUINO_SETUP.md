@@ -1,12 +1,12 @@
-# 🔌 Configurazione Hardware e Firmware Arduino — M.A.R.
+# Configurazione Hardware e Firmware Arduino — M.A.R.
 
 Guida per il collegamento hardware tra la scheda **Arduino (Mega / Uno / Nano)**, il driver motori **L298N**, il sensore ad ultrasuoni **HC-SR04** e il canale seriale USB con il **Raspberry Pi 5**.
 
 ---
 
-## 📌 Schema Cablaggio Pin
+## Schema Cablaggio Pin
 
-### 1. Driver Motori DC (L298N)
+###1. Driver Motori DC (L298N)
 
 | Funzione Hardware | Pin Arduino | Descrizione |
 | :--- | :--- | :--- |
@@ -18,7 +18,7 @@ Guida per il collegamento hardware tra la scheda **Arduino (Mega / Uno / Nano)**
 | **ENB** (PWM Motore DX) | **D12** | Velocità motore DX (segnale analogico PWM 0-255) |
 | **GND** | **GND** | Massa comune con alimentazione batterie motori |
 
-### 2. Sensore a Ultrasuoni HC-SR04
+###2. Sensore a Ultrasuoni HC-SR04
 
 Il firmware supporta sia la modalità a **singolo pin** (TRIGGER ed ECHO ponticellati insieme) sia la modalità standard a **due pin**:
 
@@ -31,7 +31,7 @@ Il firmware supporta sia la modalità a **singolo pin** (TRIGGER ed ECHO pontice
 
 ---
 
-## 💻 Caricamento del Firmware
+## Caricamento del Firmware
 
 1. Collega la scheda Arduino al computer via cavo USB.
 2. Apri l'Arduino IDE.
@@ -43,11 +43,11 @@ Il firmware supporta sia la modalità a **singolo pin** (TRIGGER ed ECHO pontice
 
 ---
 
-## 📡 Protocollo di Comunicazione Seriale
+## Protocollo di Comunicazione Seriale
 
 La comunicazione avviene a **9600** o **115200** baud delimitata da caratteri di ritorno a capo (`\n`).
 
-### Comandi Downlink (RPi 5 ➔ Arduino)
+###Comandi Downlink (RPi 5 -> Arduino)
 
 | Comando M.A.R. | Comando Legacy | Azione |
 | :--- | :---: | :--- |
@@ -58,7 +58,7 @@ La comunicazione avviene a **9600** o **115200** baud delimitata da caratteri di
 | `CMD:TURN_R,<0-100>` | `R` | Rotazione sul posto verso destra |
 | `CMD:STATUS` | `?` | Richiesta telemetria immediata |
 
-### Telemetria Uplink (Arduino ➔ RPi 5)
+###Telemetria Uplink (Arduino -> RPi 5)
 
 Ad ogni ciclo di campionamento (10-15 Hz), Arduino trasmette sulla seriale:
 ```text
@@ -73,7 +73,7 @@ EMERGENCY_STOP:14.2cm
 
 ---
 
-## 🛡️ Meccanismi di Sicurezza Hardware Integrati
+##️ Meccanismi di Sicurezza Hardware Integrati
 
 1. **Watchdog Heartbeat (1000 ms)**:
    Se per oltre 1 secondo Arduino non riceve alcun comando dalla seriale (crash di Python, cavo USB disconnesso o blocco del software), il firmware entra autonomamente in arresto e azzera le uscite PWM dei motori.

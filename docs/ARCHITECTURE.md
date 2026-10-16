@@ -1,10 +1,10 @@
-# 🏗️ Architettura del Sistema di Stereovisione 3D — M.A.R.
+#️ Architettura del Sistema di Stereovisione 3D — M.A.R.
 
 Il modulo `stereovisione` costituisce l'organo di **percezione visiva attiva e comprensione spaziale 3D** del robot quadrupede bio-ispirato **M.A.R. (Multi-legged Autonomous Robot)** su Raspberry Pi 5 / macOS.
 
 ---
 
-## 📐 Flusso Computazionale e Pipeline dei Dati
+## Flusso Computazionale e Pipeline dei Dati
 
 La pipeline di elaborazione elabora flussi sincronizzati ad alta velocità combinando Computer Vision geometrica (disparità) e intelligenza artificiale semantica (YOLO):
 
@@ -47,9 +47,9 @@ flowchart TD
 
 ---
 
-## 🧩 Moduli Software
+## Moduli Software
 
-### 1. `camera/`
+###1. `camera/`
 - **`StereoCameraDriver`**:
   - Auto-discovery su backend `AVFoundation` (macOS) e `V4L2` (Linux).
   - Configurazione hardware nativa per Global Shutter: disattivazione di autofocus ed auto-esposizione per prevenire artefatti e scatti durante i movimenti cinematici del quadrupede.
@@ -59,14 +59,14 @@ flowchart TD
   - Calcola la disparità pixel per pixel tra occhio sinistro e destro.
   - Estrae la distanza reale in centimetri all'interno del ROI (Region of Interest) centrale dei bounding box rilevati.
 
-### 2. `detector/`
+###2. `detector/`
 - **`YOLODetector`**:
   - Gestione unificata di tutti i modelli YOLO supportati da Ultralytics (v5, v8, v9, v10, v11, v26+).
   - Supporto per tutte le dimensioni (nano `n`, small `s`, medium `m`, large `l`, extra-large `x`).
   - Ottimizzazione dell'inferenza tramite batch processing sincrono su coppia stereo `[frame_left, frame_right]`.
   - Rendering annotazioni con codice colore proporzionale al livello di rischio collisione.
 
-### 3. `navigation/`
+###3. `navigation/`
 - **`ObstacleAvoidanceEngine`**:
   - Suddivide la visuale in **3 zone spaziali**: *Settore Sinistro*, *Corridoio Centrale Critico (Danger Zone)* e *Settore Destro*.
   - Ponderazione multi-fattore del rischio:
@@ -77,14 +77,14 @@ flowchart TD
     - **SLOW_FORWARD**: Rischio $\ge 1.5$; rallentamento con cautela.
     - **FORWARD**: Corridoio libero a velocità nominale.
 
-### 4. `server/`
+###4. `server/`
 - **`MultiStreamServer`**:
   - Server HTTP multi-thread ad altissime prestazioni scritto con `ThreadingHTTPServer` della libreria standard Python.
   - Zero latenza aggiuntiva: codifica JPEG asincrona e lock thread-safe.
   - Header **CORS** (`Access-Control-Allow-Origin: *`) per il rendering immediato nella web application Next.js.
   - Endpoint REST `/api/status` per telemetria, FPS e stato macchina.
 
-### 5. `comms/`
+###5. `comms/`
 - **`ArduinoSerialBridge`**:
   - Thread separato in background per l'ascolto non-bloccante della seriale USB.
   - Parsing automatico della telemetria (`ULTRASONIC:XXcm`, `TLM:...`, `ARDUINO_READY`).

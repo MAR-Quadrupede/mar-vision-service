@@ -1,10 +1,10 @@
-# 📐 Guida alla Calibrazione Stereoscopica e Mappa di Profondità
+# Guida alla Calibrazione Stereoscopica e Mappa di Profondità
 
 La stima della distanza 3D $(X, Y, Z)$ si basa sulla triangolazione epipolare tra i due sensori della stereocamera 3D Global Shutter.
 
 ---
 
-## 🔬 Principio Fisico della Visione Stereoscopica
+## Principio Fisico della Visione Stereoscopica
 
 Dati due sensori ottici paralleli separati da una distanza nota $B$ (baseline), un punto nello spazio $P$ viene proiettato nei piani immagine a coordinate orizzontali $x_L$ e $x_R$:
 
@@ -22,7 +22,7 @@ Dove:
 
 ---
 
-## ⚙️ Parametri Ottimali per StereoSGBM
+##️ Parametri Ottimali per StereoSGBM
 
 Il modulo [`stereo_depth.py`](file:///Users/gianluca/Desktop/m.a.r./stereovisione/camera/stereo_depth.py) adotta l'algoritmo **Semi-Global Block Matching**:
 
@@ -38,7 +38,7 @@ Il modulo [`stereo_depth.py`](file:///Users/gianluca/Desktop/m.a.r./stereovision
 
 ---
 
-## 🎯 Stima della Distanza degli Oggetti YOLO
+## Stima della Distanza degli Oggetti YOLO
 
 Invece di calcolare la distanza punto per punto su tutto il frame (computazionalmente oneroso per il processore ARM del Raspberry Pi 5):
 1. Viene calcolata la disparità $d$.

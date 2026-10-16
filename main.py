@@ -88,11 +88,20 @@ def run_vision_service(config: AppConfig):
             # Inferenza YOLO
             left_ann, right_ann, left_objs, right_objs = detector.detect_stereo(left_raw, right_raw)
 
-            # Stima disparità stereo
+            # Stima disparità stereo & Griglia Spaziale 3D a 9 Zone
             color_disp = None
+            grid_3d = {}
+            depth_metrics = {
+                "ground_hazard": False,
+                "critical_front_cm": 999.0,
+                "z_basso": 999.0,
+                "z_centro": 999.0,
+                "z_alto": 999.0
+            }
+
             if depth_estimator:
-                disp_map = depth_estimator.compute_disparity(left_raw, right_raw)
-                color_disp = depth_estimator.get_color_disparity_map(disp_map)
+                grid_3d, color_disp, depth_metrics = depth_estimator.compute_spatial_grid_3d(left_raw, right_raw)
+                disp_map = depth_estimator.compute_disparity(left_raw, right_raw, apply_clahe=False)
                 for obj in left_objs:
                     obj.estimated_distance_cm = depth_estimator.estimate_bbox_distance_cm(disp_map, obj.bbox)
 
@@ -114,9 +123,21 @@ def run_vision_service(config: AppConfig):
                             "sector": "CENTER" if (w_eye * 0.33 <= o.center_x <= w_eye * 0.66) else ("LEFT" if o.center_x < w_eye * 0.33 else "RIGHT")
                         }
                         for o in left_objs
-                    ]
+                    ],
+                    "spatial_grid_3d": grid_3d,
+                    "ground_hazard": depth_metrics["ground_hazard"],
+                    "z_basso_cm": depth_metrics["z_basso"],
+                    "z_centro_cm": depth_metrics["z_centro"]
                 }
                 mqtt_client.publish("mar/vision/detections", json.dumps(detected_payload))
+
+                # Se rilevato ostacolo basso a terra non visibile dal LiDAR, invia alert specifico
+                if depth_metrics["ground_hazard"]:
+                    mqtt_client.publish("mar/vision/ground_hazard", json.dumps({
+                        "timestamp": now,
+                        "z_basso_cm": depth_metrics["z_basso"],
+                        "hazard": "TERRAIN_OR_LOW_OBSTACLE"
+                    }))
 
             # Aggiornamento frame sul server MJPEG
             if config.stream.enabled:

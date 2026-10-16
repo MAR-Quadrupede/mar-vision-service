@@ -47,9 +47,13 @@ class DepthConfig:
     enabled: bool = False
     min_disparity: int = 0
     num_disparities: int = 64     # Must be divisible by 16
-    block_size: int = 9           # Odd number, usually 5..11
+    block_size: int = 5           # Optimal window size for robot ELP stereo camera
     baseline_cm: float = 6.0      # Physical distance between left & right lenses
-    focal_length_px: float = 700.0 # Approximate focal length in pixels (calibratable)
+    focal_length_px: float = 1006.5 # Default focal length in pixels (from mtx_L)
+    calibration_file: Optional[str] = "parametri_calibrazione_stereo.npz"
+    use_wls_filter: bool = True
+    enable_spatial_grid: bool = True
+    ground_hazard_threshold_cm: float = 40.0 # Trigger STOP_TERRA when lower ground obstacle detected
 
 
 @dataclass

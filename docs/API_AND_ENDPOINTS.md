@@ -1,4 +1,4 @@
-# 🌐 Specifiche API & Streaming Endpoints — M.A.R.
+# Specifiche API & Streaming Endpoints — M.A.R.
 
 Il server di streaming integrato espone i flussi video MJPEG e gli endpoint REST utilizzati da **`dashboard-mar-quadrupede`** (Next.js) e da qualsiasi client HTTP.
 
@@ -6,7 +6,7 @@ Porta predefinita: **`8443`** (configurabile con `--port`).
 
 ---
 
-## 📹 Flussi Video MJPEG (`multipart/x-mixed-replace`)
+## Flussi Video MJPEG (`multipart/x-mixed-replace`)
 
 Tutti i flussi video sono conformi allo standard MJPEG e includono gli header `Cache-Control: no-cache` e `Access-Control-Allow-Origin: *`.
 
@@ -20,13 +20,13 @@ Tutti i flussi video sono conformi allo standard MJPEG e includono gli header `C
 
 ---
 
-## 📊 REST API di Telemetria
+## REST API di Telemetria
 
-### `GET /api/status`
+###`GET /api/status`
 
 Restituisce un payload JSON contenente la telemetria in tempo reale del sottosistema visivo e dei sensori.
 
-#### Esempio di Risposta JSON:
+####Esempio di Risposta JSON:
 
 ```json
 {
@@ -41,7 +41,7 @@ Restituisce un payload JSON contenente la telemetria in tempo reale del sottosis
 }
 ```
 
-#### Campi del Payload:
+####Campi del Payload:
 
 - **`status`** (`string`): Stato del server (`ONLINE`, `DISCONNECTED`).
 - **`fps`** (`float`): Frame rate effettivo del ciclo di acquisizione ed inferenza.
@@ -54,9 +54,9 @@ Restituisce un payload JSON contenente la telemetria in tempo reale del sottosis
 
 ---
 
-## 🖥️ Interfaccia Web di Monitoraggio
+##️ Interfaccia Web di Monitoraggio
 
-### `GET /`
+###`GET /`
 
 Accedendo con qualsiasi browser a `http://localhost:8443/` viene servita una dashboard web nativa in HTML5 / CSS3 scuro, che mostra in una griglia responsive:
 - Il flusso live annotato sinistro e destro
