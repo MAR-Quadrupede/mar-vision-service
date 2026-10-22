@@ -116,11 +116,11 @@ def run_vision_service(config: AppConfig):
                     "count": len(all_objects),
                     "objects": [
                         {
-                            "class": o.class_name,
+                            "class": o.label,
                             "confidence": round(float(o.confidence), 2),
                             "bbox": [int(x) for x in o.bbox],
                             "distance_cm": round(float(o.estimated_distance_cm), 1) if o.estimated_distance_cm else None,
-                            "sector": "CENTER" if (w_eye * 0.33 <= o.center_x <= w_eye * 0.66) else ("LEFT" if o.center_x < w_eye * 0.33 else "RIGHT")
+                            "sector": "CENTER" if (w_eye * 0.33 <= o.center[0] <= w_eye * 0.66) else ("LEFT" if o.center[0] < w_eye * 0.33 else "RIGHT")
                         }
                         for o in left_objs
                     ],

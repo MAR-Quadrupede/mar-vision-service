@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --default-timeout=1000 --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 
 COPY . .
 
@@ -21,4 +21,4 @@ ENV MQTT_PORT=1883
 
 EXPOSE 8080
 
-CMD ["python", "main.py", "--headless", "--depth", "--stream"]
+CMD ["python", "main.py", "--headless", "--depth"]
