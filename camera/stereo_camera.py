@@ -70,6 +70,10 @@ class StereoCameraDriver:
                 try:
                     cap = cv2.VideoCapture(index, backend)
                     if cap.isOpened():
+                        try:
+                            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                        except Exception:
+                            pass
                         # Read a test frame to ensure stream is valid
                         ret, test_frame = cap.read()
                         if ret and test_frame is not None and test_frame.size > 0:
@@ -93,22 +97,30 @@ class StereoCameraDriver:
         if not self.cap or not self.is_opened:
             return
 
+        try:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        except Exception:
+            pass
+
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
         self.cap.set(cv2.CAP_PROP_FPS, self.config.fps)
 
-        # Disable autofocus and autoexposure to avoid jitter during robot motion
-        if not self.config.auto_focus:
+        if platform.system() == "Linux" and self.active_index is not None:
             try:
-                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+                import subprocess
+                subprocess.run(
+                    ["v4l2-ctl", "-d", f"/dev/video{self.active_index}", "-c",
+                     "auto_exposure=1,exposure_time_absolute=800,gain=120,gamma=150,white_balance_automatic=1"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+                )
             except Exception:
                 pass
 
-        if not self.config.auto_exposure:
-            try:
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-            except Exception:
-                pass
+        try:
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        except Exception:
+            pass
 
         act_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         act_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
