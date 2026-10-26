@@ -65,26 +65,29 @@ class StereoCameraDriver:
 
         print("\n[CAMERA] Inizializzazione 3D Global Shutter Stereo Camera...")
 
-        for index in indices:
-            for backend in backends:
-                try:
-                    cap = cv2.VideoCapture(index, backend)
-                    if cap.isOpened():
-                        try:
-                            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                        except Exception:
-                            pass
-                        # Read a test frame to ensure stream is valid
-                        ret, test_frame = cap.read()
-                        if ret and test_frame is not None and test_frame.size > 0:
-                            self.cap = cap
-                            self.active_index = index
-                            self.is_opened = True
-                            self._apply_hardware_settings()
-                            return True
-                    cap.release()
-                except Exception:
-                    pass
+        for attempt in range(1, 4):
+            for index in indices:
+                for backend in backends:
+                    try:
+                        cap = cv2.VideoCapture(index, backend)
+                        if cap.isOpened():
+                            try:
+                                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                            except Exception:
+                                pass
+                            # Read a test frame to ensure stream is valid
+                            ret, test_frame = cap.read()
+                            if ret and test_frame is not None and test_frame.size > 0:
+                                self.cap = cap
+                                self.active_index = index
+                                self.is_opened = True
+                                self._apply_hardware_settings()
+                                return True
+                        cap.release()
+                    except Exception:
+                        pass
+            if attempt < 3:
+                time.sleep(1.0)
 
         print("  ⚠️ Nessuna telecamera fisica disponibile sui dispositivi testati.")
         print("  🔧 Attivazione modalità MOCK SINTETICA per test ed emulazione continua...")

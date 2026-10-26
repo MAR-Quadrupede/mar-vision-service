@@ -52,6 +52,8 @@ class MultiStreamServer:
         server_ref = self
 
         class StreamRequestHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_OPTIONS(self):
                 """Handles CORS preflight requests."""
                 self.send_response(200)
@@ -91,6 +93,15 @@ class MultiStreamServer:
                     self._serve_test_page()
                     return
 
+                # Single JPEG snapshots
+                if self.path in ("/snapshot_left.jpg", "/snapshot_left.jpeg"):
+                    self._serve_snapshot("left")
+                    return
+
+                if self.path in ("/snapshot_right.jpg", "/snapshot_right.jpeg"):
+                    self._serve_snapshot("right")
+                    return
+
                 # Endpoint mapping
                 endpoint_map = {
                     "/stream_left.mjpg": "left",
@@ -107,12 +118,29 @@ class MultiStreamServer:
                 stream_key = endpoint_map[self.path]
                 self._stream_mjpeg(stream_key)
 
+            def _serve_snapshot(self, key: str):
+                """Serves single instant JPEG snapshot with no-cache headers."""
+                with server_ref._lock:
+                    frame_bytes = server_ref._frames.get(key)
+
+                if frame_bytes is None:
+                    self.send_error(503, "Frame non ancora disponibile")
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(frame_bytes)))
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(frame_bytes)
+
             def _stream_mjpeg(self, key: str):
                 """Streams multipart/x-mixed-replace JPEG frames."""
                 self.send_response(200)
-                self.send_header("Cache-Control", "no-cache, private, no-store, must-revalidate")
+                self.send_header("Cache-Control", "no-cache, private, no-store, must-revalidate, max-age=0")
                 self.send_header("Pragma", "no-cache")
-                self.send_header("Connection", "close")
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
@@ -123,7 +151,7 @@ class MultiStreamServer:
                             frame_bytes = server_ref._frames.get(key)
 
                         if frame_bytes is None:
-                            time.sleep(0.03)
+                            time.sleep(0.02)
                             continue
 
                         self.wfile.write(b"--frame\r\n")
@@ -131,7 +159,8 @@ class MultiStreamServer:
                         self.wfile.write(f"Content-Length: {len(frame_bytes)}\r\n\r\n".encode("ascii"))
                         self.wfile.write(frame_bytes)
                         self.wfile.write(b"\r\n")
-                        time.sleep(0.033)  # ~30 FPS throttling
+                        self.wfile.flush()
+                        time.sleep(0.035)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
