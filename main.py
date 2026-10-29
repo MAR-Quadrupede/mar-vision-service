@@ -115,11 +115,43 @@ def run_vision_service(config: AppConfig):
                     "reason": driving_reason,
                     "target_dist_cm": round(float(target_dist), 1),
                     "obstacle_near_cm": round(float(obs_dist), 1),
-                    "ground_hazard": ground_hazard,
+                    "ground_hazard": depth_res.get("ground_hazard", ground_hazard),
+                    "z_basso_cm": round(float(depth_res.get("z_basso_cm", 999.0)), 1),
+                    "z_centro_cm": round(float(depth_res.get("z_centro_cm", 999.0)), 1),
                     "safety_alarm": depth_res["safety_alarm"],
                     "safety_reason": depth_res["safety_reason"]
                 }
                 mqtt_client.publish("mar/vision/command", json.dumps(decision_payload))
+
+                # Griglia 3D, settori spaziali e oggetti per la sensor fusion
+                detections_payload = {
+                    "timestamp": now,
+                    "spatial_grid_3d": depth_res.get("spatial_grid_3d", {}),
+                    "z_basso_cm": round(float(depth_res.get("z_basso_cm", 999.0)), 1),
+                    "z_centro_cm": round(float(depth_res.get("z_centro_cm", 999.0)), 1),
+                    "z_alto_cm": round(float(depth_res.get("z_alto_cm", 999.0)), 1),
+                    "ground_hazard": depth_res.get("ground_hazard", ground_hazard),
+                    "target_dist_cm": round(float(target_dist), 1),
+                    "objects_count": len(all_objects),
+                    "objects": [
+                        {
+                            "class": o.label,
+                            "confidence": round(float(o.confidence), 2),
+                            "bbox": [int(x) for x in o.bbox]
+                        }
+                        for o in left_objs
+                    ]
+                }
+                mqtt_client.publish("mar/vision/detections", json.dumps(detections_payload))
+
+                # Allarme ostacolo a terra se presente
+                if depth_res.get("ground_hazard", False) or ground_hazard:
+                    ground_payload = {
+                        "timestamp": now,
+                        "hazard": True,
+                        "z_basso_cm": round(float(depth_res.get("z_basso_cm", 999.0)), 1)
+                    }
+                    mqtt_client.publish("mar/vision/ground_hazard", json.dumps(ground_payload))
 
                 # Oggetti YOLO e telemetria
                 telemetry_payload = {

@@ -244,8 +244,8 @@ class StereoDepthEstimator:
             self.has_calibration = True
 
             f_px = abs(Q[2, 3])
-            baseline_m = 1.0 / abs(Q[3, 2]) if abs(Q[3, 2]) > 1e-6 else 0.06
-            print(f"  ✓ [DEPTH] Calibrazione stereo caricata da {calib_file.name}: Focale={f_px:.1f}px, Base={baseline_m*100:.1f}cm")
+            baseline_cm = (1.0 / abs(Q[3, 2])) / 10.0 if abs(Q[3, 2]) > 1e-6 else 6.0
+            print(f"  ✓ [DEPTH] Calibrazione stereo caricata da {calib_file.name}: Focale={f_px:.1f}px, Base={baseline_cm:.1f}cm")
 
         except Exception as e:
             print(f"  ⚠️ [DEPTH] Errore inizializzazione matrici di rettificazione: {e}")
@@ -370,6 +370,41 @@ class StereoDepthEstimator:
         punti_3d = cv2.reprojectImageTo3D(disparity_veloce, self.Q_veloce)
         punti_3d_cm = punti_3d / 10.0
         H_vel, W_vel = disparity_veloce.shape[:2]
+
+        # Griglia Spaziale 3D a 9 Zone (Alto, Centro, Basso x SX, Centro, DX)
+        spatial_grid_3d: Dict[str, Tuple[float, float, float]] = {}
+        h_step, w_step = max(1, H_vel // 3), max(1, W_vel // 3)
+        nomi_riga = ["Alto", "Centro", "Basso"]
+        nomi_col = ["SX", "Centro", "DX"]
+
+        # Trasformazione nel frame del robot (rotazione 180° per montaggio a testa in giù)
+        punti_robot_cm = np.zeros_like(punti_3d_cm)
+        punti_robot_cm[:, :, 0] = -np.flip(np.flip(punti_3d_cm[:, :, 0], 0), 1)
+        punti_robot_cm[:, :, 1] = -np.flip(np.flip(punti_3d_cm[:, :, 1], 0), 1)
+        punti_robot_cm[:, :, 2] = np.flip(np.flip(punti_3d_cm[:, :, 2], 0), 1)
+
+        for r in range(3):
+            for c in range(3):
+                nome_settore = f"{nomi_riga[r]}_{nomi_col[c]}"
+                roi_Z = punti_robot_cm[r * h_step:(r + 1) * h_step, c * w_step:(c + 1) * w_step, 2]
+                roi_X = punti_robot_cm[r * h_step:(r + 1) * h_step, c * w_step:(c + 1) * w_step, 0]
+                roi_Y = punti_robot_cm[r * h_step:(r + 1) * h_step, c * w_step:(c + 1) * w_step, 1]
+
+                valid_grid = (roi_Z > 10.0) & (roi_Z <= 400.0) & np.isfinite(roi_Z)
+                if np.count_nonzero(valid_grid) > 8:
+                    z_vals = roi_Z[valid_grid]
+                    q_l, q_h = np.percentile(z_vals, [15, 85])
+                    filt_grid = (roi_Z >= q_l) & (roi_Z <= q_h) & valid_grid
+                    if np.count_nonzero(filt_grid) > 0:
+                        m_z = float(np.median(roi_Z[filt_grid]))
+                        m_x = float(np.median(roi_X[filt_grid]))
+                        m_y = float(np.median(roi_Y[filt_grid]))
+                        spatial_grid_3d[nome_settore] = (round(m_x, 1), round(m_y, 1), round(m_z, 1))
+
+        z_basso_cm = spatial_grid_3d.get("Basso_Centro", (0.0, 0.0, 999.0))[2]
+        z_centro_cm = spatial_grid_3d.get("Centro_Centro", (0.0, 0.0, 999.0))[2]
+        z_alto_cm = spatial_grid_3d.get("Alto_Centro", (0.0, 0.0, 999.0))[2]
+        ground_hazard = bool(z_basso_cm < 40.0)
 
         # La telecamera è fisicamente invertita di 180°:
         # Le righe 0 .. 0.28*H_vel corrispondono al basamento/tavolo del rover.
@@ -588,6 +623,11 @@ class StereoDepthEstimator:
             "obstacle_found": ostacolo_trovato,
             "obstacle_dist_cm": dist_ostacolo_cm,
             "target_dist_cm": distanza_per_switch,
+            "spatial_grid_3d": spatial_grid_3d,
+            "z_basso_cm": z_basso_cm,
+            "z_centro_cm": z_centro_cm,
+            "z_alto_cm": z_alto_cm,
+            "ground_hazard": ground_hazard,
             "obstacle_bbox": bbox_ostacolo,
             "autofocus_offset_x": offset_autofocus_x,
             "current_mode": self.modalita_vista,
