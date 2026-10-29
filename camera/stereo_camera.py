@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 M.A.R. — 3D Global Shutter Stereo Camera Driver
-Supports native side-by-side acquisition, cross-platform backend selection,
-hardware parameter configuration, and mock stream generation for development.
+Supports threaded non-blocking acquisition, hardware parameter configuration,
+upside-down mounting 180° rotation, and high-fidelity mock stream generation.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, List
 import platform
+import subprocess
 import threading
 import time
 import cv2
@@ -32,17 +33,26 @@ class StereoFrame:
 class StereoCameraDriver:
     """
     High-reliability driver for USB 3.0 / USB 2.0 Stereo Cameras.
-    Designed for 3D Global Shutter modules in Side-by-Side (SBS) format.
+    Uses dedicated capture thread with Condition variable to eliminate frame lag
+    and ensure buffer size 1 with minimal latency.
     """
 
-    def __init__(self, config: CameraConfig):
+    def __init__(self, config: CameraConfig, upside_down: bool = True):
         self.config = config
+        self.upside_down = upside_down
         self.cap: Optional[cv2.VideoCapture] = None
         self.active_index: Optional[int] = None
         self.is_opened = False
         self.is_mock = False
+
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+
+        self._latest_frame: Optional[StereoFrame] = None
         self._mock_step = 0
+        self.actual_fps = 0.0
 
     def _get_backends(self) -> List[int]:
         """Returns ordered list of OpenCV capture backends for the current OS."""
@@ -73,26 +83,32 @@ class StereoCameraDriver:
                         if cap.isOpened():
                             try:
                                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                             except Exception:
                                 pass
-                            # Read a test frame to ensure stream is valid
+                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
+                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
+                            cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+
                             ret, test_frame = cap.read()
                             if ret and test_frame is not None and test_frame.size > 0:
                                 self.cap = cap
                                 self.active_index = index
                                 self.is_opened = True
                                 self._apply_hardware_settings()
+                                self._start_capture_thread()
                                 return True
                         cap.release()
                     except Exception:
                         pass
             if attempt < 3:
-                time.sleep(1.0)
+                time.sleep(0.5)
 
         print("  ⚠️ Nessuna telecamera fisica disponibile sui dispositivi testati.")
         print("  🔧 Attivazione modalità MOCK SINTETICA per test ed emulazione continua...")
         self.is_mock = True
         self.is_opened = True
+        self._start_capture_thread()
         return True
 
     def _apply_hardware_settings(self):
@@ -102,6 +118,7 @@ class StereoCameraDriver:
 
         try:
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
 
@@ -111,7 +128,6 @@ class StereoCameraDriver:
 
         if platform.system() == "Linux" and self.active_index is not None:
             try:
-                import subprocess
                 subprocess.run(
                     ["v4l2-ctl", "-d", f"/dev/video{self.active_index}", "-c",
                      "auto_exposure=1,exposure_time_absolute=800,gain=120,gamma=150,white_balance_automatic=1"],
@@ -133,6 +149,13 @@ class StereoCameraDriver:
         print(f"  • Dispositivo: /dev/video{self.active_index} (Index {self.active_index})")
         print(f"  • Risoluzione totale: {act_w}x{act_h} (Risoluzione occhio: {act_w//2}x{act_h})")
         print(f"  • Frame rate: {act_fps:.1f} FPS (Global Shutter mode)")
+        print(f"  • Montaggio invertito 180°: {'ATTIVO' if self.upside_down else 'DISATTIVO'}")
+
+    def _start_capture_thread(self):
+        """Starts asynchronous acquisition thread."""
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_worker, name="CameraCaptureThread", daemon=True)
+        self._thread.start()
 
     def _generate_mock_frame(self) -> StereoFrame:
         """Generates synthetic stereo frame with animated simulated obstacles."""
@@ -142,30 +165,26 @@ class StereoCameraDriver:
         half_w = width // 2
 
         now = time.time()
-        # Create gradient background
         x = np.linspace(0, 1, half_w, dtype=np.float32)
         bg_left = np.tile((x * 40 + 20).astype(np.uint8), (height, 1))
         bg_left = cv2.cvtColor(bg_left, cv2.COLOR_GRAY2BGR)
         bg_right = bg_left.copy()
 
-        # Simulated moving obstacle (e.g., ball/box) with parallax disparity
         cx = int((np.sin(self._mock_step * 0.05) * 0.35 + 0.5) * half_w)
         cy = int((np.cos(self._mock_step * 0.03) * 0.2 + 0.6) * height)
         radius = int(50 + 15 * np.sin(self._mock_step * 0.04))
-        disparity = 24  # Parallax shift between left and right
+        disparity = 24
 
-        # Draw left object
         cv2.circle(bg_left, (cx, cy), radius, (0, 140, 255), -1)
         cv2.putText(bg_left, "SIMULATORE M.A.R. - SX", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # Draw right object with horizontal disparity shift
         cv2.circle(bg_right, (cx - disparity, cy), radius, (0, 140, 255), -1)
         cv2.putText(bg_right, "SIMULATORE M.A.R. - DX", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         combined = np.hstack([bg_left, bg_right])
-        time.sleep(0.02)  # Simulate frame timing (~40-50 FPS)
+        time.sleep(0.03)
 
         return StereoFrame(
             combined=combined,
@@ -175,29 +194,39 @@ class StereoCameraDriver:
             is_mock=True
         )
 
-    def read(self) -> Optional[StereoFrame]:
-        """
-        Captures a frame and splits it into left and right views.
-        Returns StereoFrame object or None on failure.
-        """
-        with self._lock:
-            if not self.is_opened:
-                return None
+    def _capture_worker(self):
+        """Background loop acquiring fresh frames with minimal latency."""
+        n_frames = 0
+        t_fps = time.perf_counter()
 
+        while self._running:
             if self.is_mock:
-                return self._generate_mock_frame()
+                frame = self._generate_mock_frame()
+                with self._lock:
+                    self._latest_frame = frame
+                    self._cond.notify_all()
+                continue
+
+            if not self.cap or not self.cap.isOpened():
+                time.sleep(0.1)
+                continue
 
             ret, combined = self.cap.read()
             if not ret or combined is None or combined.size == 0:
-                return None
+                time.sleep(0.01)
+                continue
+
+            if self.upside_down:
+                # 180° rotation flips horizontal and vertical
+                combined = cv2.flip(combined, -1)
 
             h, w = combined.shape[:2]
-            mid = w // 2
+            hw = w // 2
 
-            left = combined[:, :mid].copy()
-            right = combined[:, mid:].copy()
+            left = combined[:, :hw].copy()
+            right = combined[:, hw:].copy()
 
-            return StereoFrame(
+            frame = StereoFrame(
                 combined=combined,
                 left=left,
                 right=right,
@@ -205,8 +234,43 @@ class StereoCameraDriver:
                 is_mock=False
             )
 
+            n_frames += 1
+            now = time.perf_counter()
+            if now - t_fps >= 1.0:
+                self.actual_fps = n_frames / (now - t_fps)
+                n_frames = 0
+                t_fps = now
+
+            with self._lock:
+                self._latest_frame = frame
+                self._cond.notify_all()
+
+    def read(self, timeout: float = 0.5) -> Optional[StereoFrame]:
+        """
+        Returns the freshest stereo frame, waiting on condition variable if necessary.
+        """
+        with self._lock:
+            if self._latest_frame is not None:
+                frame = self._latest_frame
+                self._latest_frame = None
+                return frame
+
+            if self._cond.wait(timeout=timeout):
+                frame = self._latest_frame
+                self._latest_frame = None
+                return frame
+            return None
+
     def release(self):
-        """Releases the camera hardware."""
+        """Releases the camera hardware and shuts down acquisition thread."""
+        self._running = False
+        with self._lock:
+            self._cond.notify_all()
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
         with self._lock:
             if self.cap:
                 self.cap.release()
