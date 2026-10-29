@@ -27,7 +27,7 @@ except ImportError:
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 # YOLO every N depth frames (1=every frame). On RPi default 3 keeps UI fluid.
-YOLO_STRIDE = max(1, int(os.getenv("MAR_YOLO_STRIDE", "3")))
+YOLO_STRIDE = max(1, int(os.getenv("MAR_YOLO_STRIDE", "8")))
 # Max width for MJPEG encode (original script used 960)
 STREAM_MAX_W = int(os.getenv("MAR_STREAM_MAX_W", "960"))
 
