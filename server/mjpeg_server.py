@@ -540,6 +540,10 @@ class MultiStreamServer:
             self._running = False
             return False
 
+    def active_clients(self) -> int:
+        """Number of currently connected MJPEG stream clients."""
+        return int(self._active_stream_clients)
+
     def update_frame(self, key: str, frame: np.ndarray):
         """Encodes frame as JPEG and stores in memory buffer."""
         if not self._running or frame is None:

@@ -34,6 +34,7 @@ class DetectorConfig:
     iou_threshold: float = 0.45
     device: str = ""             # Auto ('cpu', 'cuda', 'mps')
     enable_stereo_sync: bool = True
+    imgsz: int = 320             # Small input for RPi CPU realtime
     local_model_dirs: List[Path] = field(default_factory=lambda: [
         Path(__file__).parent / "models",
         Path(__file__).parent,
@@ -80,7 +81,7 @@ class StreamConfig:
     enabled: bool = True
     host: str = "0.0.0.0"
     port: int = 8443
-    jpeg_quality: int = 85
+    jpeg_quality: int = 70
     target_fps: int = 30
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 import os
 import json
 import time
+import platform
 import cv2
 import numpy as np
 
@@ -21,13 +22,17 @@ except (ImportError, ValueError):
 
 
 # Parametri geometrici e soglie rover M.A.R.
+# Su ARM (RPi) allineati a stereovisione_robot.4py.py: SGBM_DIV=4 + RECT_DIV=2
+# (~10× più leggero di DIV=2 a piena rettificazione) così la UI non resta a 0.5 FPS.
+IS_ARM = any(tag in platform.machine().lower() for tag in ("arm", "aarch64"))
+
 FRAME_W_ATTESO, FRAME_H_ATTESO = 2560, 800
-NUM_DISPARITIES = 64
-SGBM_BLOCK = 5
-SGBM_DIV = 2
-RECT_DIV = 1
+SGBM_DIV = int(os.getenv("MAR_SGBM_DIV", "4" if IS_ARM else "2"))
+RECT_DIV = int(os.getenv("MAR_RECT_DIV", "2" if IS_ARM else "1"))
+NUM_DISPARITIES = int(os.getenv("MAR_NUM_DISPARITIES", "96" if SGBM_DIV >= 4 else "64"))
+SGBM_BLOCK = 5 if SGBM_DIV >= 4 else 5
 VS = 1.0 / RECT_DIV
-STEP_SUB = 4
+STEP_SUB = max(1, 4 // max(1, SGBM_DIV))
 TEX_MIN = 3.5
 
 # Limiti corridoio rover (camera montata sottosopra)
@@ -235,17 +240,30 @@ class StereoDepthEstimator:
             map_L_x, map_L_y = cv2.initUndistortRectifyMap(mtx_L, dist_L, R1, P1, img_size, cv2.CV_32FC1)
             map_R_x, map_R_y = cv2.initUndistortRectifyMap(mtx_R, dist_R, R2, P2, img_size, cv2.CV_32FC1)
 
+            # Su ARM le mappe vengono sottocampionate (RECT_DIV) come nello script originale
+            if RECT_DIV > 1:
+                dim = (img_size[0] // RECT_DIV, img_size[1] // RECT_DIV)
+                map_L_x = (cv2.resize(map_L_x, dim, interpolation=cv2.INTER_AREA) + 0.5) / RECT_DIV - 0.5
+                map_L_y = (cv2.resize(map_L_y, dim, interpolation=cv2.INTER_AREA) + 0.5) / RECT_DIV - 0.5
+                map_R_x = (cv2.resize(map_R_x, dim, interpolation=cv2.INTER_AREA) + 0.5) / RECT_DIV - 0.5
+                map_R_y = (cv2.resize(map_R_y, dim, interpolation=cv2.INTER_AREA) + 0.5) / RECT_DIV - 0.5
+
             self.map_L_1, self.map_L_2 = mappe_veloci(map_L_x, map_L_y)
             self.map_R_1, self.map_R_2 = mappe_veloci(map_R_x, map_R_y)
             self.Q = Q
             self.Q_veloce = Q.copy()
-            self.Q_veloce[0, 3] /= 4.0
-            self.Q_veloce[1, 3] /= 4.0
+            # Q_veloce: griglia dopo STEP_SUB rispetto alla risoluzione di lavoro
+            scale_q = float(RECT_DIV * max(1, STEP_SUB))
+            self.Q_veloce[0, 3] /= scale_q
+            self.Q_veloce[1, 3] /= scale_q
             self.has_calibration = True
 
             f_px = abs(Q[2, 3])
             baseline_cm = (1.0 / abs(Q[3, 2])) / 10.0 if abs(Q[3, 2]) > 1e-6 else 6.0
-            print(f"  ✓ [DEPTH] Calibrazione stereo caricata da {calib_file.name}: Focale={f_px:.1f}px, Base={baseline_cm:.1f}cm")
+            print(
+                f"  ✓ [DEPTH] Calibrazione {calib_file.name}: Focale={f_px:.1f}px, Base={baseline_cm:.1f}cm | "
+                f"ARM={IS_ARM} RECT_DIV={RECT_DIV} SGBM_DIV={SGBM_DIV} numDisp={NUM_DISPARITIES}"
+            )
 
         except Exception as e:
             print(f"  ⚠️ [DEPTH] Errore inizializzazione matrici di rettificazione: {e}")
@@ -312,16 +330,22 @@ class StereoDepthEstimator:
         g_L = cv2.cvtColor(left_raw, cv2.COLOR_BGR2GRAY)
         g_R = cv2.cvtColor(right_raw, cv2.COLOR_BGR2GRAY)
 
+        # Pre-sottocampiona il grezzo se RECT_DIV>1 (mappe già scalate)
+        if RECT_DIV > 1 and not self.has_calibration:
+            g_L = cv2.resize(g_L, (w // RECT_DIV, h // RECT_DIV), interpolation=cv2.INTER_AREA)
+            g_R = cv2.resize(g_R, (w // RECT_DIV, h // RECT_DIV), interpolation=cv2.INTER_AREA)
+
         if self.has_calibration:
             rect_L = cv2.remap(g_L, self.map_L_1, self.map_L_2, cv2.INTER_LINEAR)
             rect_R = cv2.remap(g_R, self.map_R_1, self.map_R_2, cv2.INTER_LINEAR)
         else:
             rect_L, rect_R = g_L, g_R
 
-        # 2. Input per SGBM (scala 1/SGBM_DIV) con allineamento verticale epipolare
-        if SGBM_DIV > 1:
-            gs_L = cv2.resize(rect_L, (w // SGBM_DIV, h // SGBM_DIV), interpolation=cv2.INTER_AREA)
-            gs_R = cv2.resize(rect_R, (w // SGBM_DIV, h // SGBM_DIV), interpolation=cv2.INTER_AREA)
+        # 2. Input SGBM: scala RECT_DIV/SGBM_DIV rispetto alla rettificata (come script originale)
+        _f = float(RECT_DIV) / float(SGBM_DIV)
+        if abs(_f - 1.0) > 1e-3:
+            gs_L = cv2.resize(rect_L, None, fx=_f, fy=_f, interpolation=cv2.INTER_AREA)
+            gs_R = cv2.resize(rect_R, None, fx=_f, fy=_f, interpolation=cv2.INTER_AREA)
         else:
             gs_L, gs_R = rect_L, rect_R
 

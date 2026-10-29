@@ -91,34 +91,56 @@ class YOLODetector:
                 print(f"  ✗ Errore fatale: {e2}")
                 raise
 
-    def detect_single(self, frame: np.ndarray, source: str = "LEFT") -> Tuple[np.ndarray, List[DetectedObject]]:
+    def detect_single(
+        self,
+        frame: np.ndarray,
+        source: str = "LEFT",
+        imgsz: Optional[int] = None
+    ) -> Tuple[np.ndarray, List[DetectedObject]]:
         """
         Runs object detection on a single camera frame.
         Returns annotated frame and list of DetectedObject.
         """
         h, w = frame.shape[:2]
         frame_area = max(1, w * h)
+        infer_size = imgsz or getattr(self.config, "imgsz", 320)
+
+        # Downscale for CPU inference on RPi — boxes remapped to original frame size
+        infer_frame = frame
+        scale = 1.0
+        if max(h, w) > infer_size:
+            scale = infer_size / float(max(h, w))
+            infer_frame = cv2.resize(
+                frame,
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
 
         results = self.model(
-            frame,
+            infer_frame,
             conf=self.config.confidence_threshold,
             iou=self.config.iou_threshold,
+            imgsz=infer_size,
             verbose=False
         )
 
         detected_objects: List[DetectedObject] = []
-        annotated = frame.copy()
+        if frame.ndim == 2:
+            annotated = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            annotated = frame.copy()
+        inv = (1.0 / scale) if scale > 0 else 1.0
 
         if len(results) > 0 and results[0].boxes is not None:
             for box in results[0].boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                x1, y1, x2, y2 = [int(v * inv) for v in box.xyxy[0]]
                 conf = float(box.conf[0])
                 cls_id = int(box.cls[0])
                 label = self.model.names.get(cls_id, f"obj_{cls_id}")
 
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
-                area = (x2 - x1) * (y2 - y1)
+                area = max(0, (x2 - x1) * (y2 - y1))
                 rel_size = float(area) / frame_area
 
                 obj = DetectedObject(
@@ -131,6 +153,17 @@ class YOLODetector:
                     source=source
                 )
                 detected_objects.append(obj)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 200, 255), 2)
+                cv2.putText(
+                    annotated,
+                    f"{label} {conf:.2f}",
+                    (x1, max(16, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 200, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
 
         return annotated, detected_objects
 
@@ -140,21 +173,14 @@ class YOLODetector:
         right_frame: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, List[DetectedObject], List[DetectedObject]]:
         """
-        Runs batch or synchronized inference on left and right frames.
-        Returns (annotated_left, annotated_right, left_objects, right_objects).
+        Left-eye only on edge hardware. Dual YOLO was freezing depth to ~0.5 FPS.
         """
-        # Batch inference in a single call for high throughput
-        batch_results = self.model(
-            [left_frame, right_frame],
-            conf=self.config.confidence_threshold,
-            iou=self.config.iou_threshold,
-            verbose=False
-        )
-
-        left_ann, left_objs = self._extract_results(left_frame, batch_results[0], "LEFT")
-        right_ann, right_objs = self._extract_results(right_frame, batch_results[1], "RIGHT")
-
-        return left_ann, right_ann, left_objs, right_objs
+        left_ann, left_objs = self.detect_single(left_frame, "LEFT")
+        if right_frame.ndim == 2:
+            right_ann = cv2.cvtColor(right_frame, cv2.COLOR_GRAY2BGR)
+        else:
+            right_ann = right_frame
+        return left_ann, right_ann, left_objs, []
 
     def _extract_results(
         self,

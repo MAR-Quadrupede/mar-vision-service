@@ -26,6 +26,23 @@ except ImportError:
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+# YOLO every N depth frames (1=every frame). On RPi default 3 keeps UI fluid.
+YOLO_STRIDE = max(1, int(os.getenv("MAR_YOLO_STRIDE", "3")))
+# Max width for MJPEG encode (original script used 960)
+STREAM_MAX_W = int(os.getenv("MAR_STREAM_MAX_W", "960"))
+
+
+def _prep_stream_frame(frame):
+    """Downscale large frames before JPEG encode to cut encode+Tailscale cost."""
+    if frame is None:
+        return None
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    h, w = frame.shape[:2]
+    if w > STREAM_MAX_W:
+        nh = int(h * STREAM_MAX_W / w)
+        return cv2.resize(frame, (STREAM_MAX_W, nh), interpolation=cv2.INTER_AREA)
+    return frame
 
 
 def run_vision_service(config: AppConfig):
@@ -72,6 +89,11 @@ def run_vision_service(config: AppConfig):
     frame_count = 0
     t_fps_start = time.time()
     last_mqtt_pub = 0.0
+    loop_i = 0
+    cached_left_ann = None
+    cached_right_ann = None
+    cached_left_objs: list = []
+    print(f"  • YOLO stride: ogni {YOLO_STRIDE} frame | stream max width: {STREAM_MAX_W}px")
 
     try:
         while True:
@@ -82,6 +104,7 @@ def run_vision_service(config: AppConfig):
                 continue
 
             frame_count += 1
+            loop_i += 1
             left_raw = stereo_frame.left
             right_raw = stereo_frame.right
 
@@ -96,11 +119,19 @@ def run_vision_service(config: AppConfig):
             obs_dist = depth_res["obstacle_dist_cm"] if depth_res["obstacle_found"] else 999.0
             ground_hazard = (target_dist < 45.0)
 
-            # 3. Inferenza YOLO opzionale per arricchire i flussi
-            left_ann, right_ann, left_objs, right_objs = detector.detect_stereo(
-                depth_res["rect_left"],
-                depth_res["rect_right"]
-            )
+            # 3. YOLO left-only, throttled — depth/UI stay realtime when you walk in front
+            if (loop_i % YOLO_STRIDE) == 1 or cached_left_ann is None:
+                left_ann, right_ann, left_objs, right_objs = detector.detect_stereo(
+                    depth_res["rect_left"],
+                    depth_res["rect_right"]
+                )
+                cached_left_ann, cached_right_ann = left_ann, right_ann
+                cached_left_objs = left_objs
+            else:
+                left_ann = cached_left_ann
+                right_ann = cached_right_ann
+                left_objs = cached_left_objs
+                right_objs = []
             all_objects = left_objs + right_objs
 
             # 4. Pubblicazione Decisione di Guida e Rilevamenti su MQTT
@@ -170,14 +201,16 @@ def run_vision_service(config: AppConfig):
                 }
                 mqtt_client.publish("mar/vision/status", json.dumps(telemetry_payload))
 
-            # 5. Aggiornamento Frame e Telemetria sul Server MJPEG
+            # 5. Aggiornamento Frame e Telemetria sul Server MJPEG (downscaled JPEG)
             if config.stream.enabled:
-                stream_server.update_frame("composite", composite)
+                stream_server.update_frame("composite", _prep_stream_frame(composite))
                 stream_server.update_frame("map", map_2d)
-                stream_server.update_frame("left", left_ann)
-                stream_server.update_frame("right", right_ann)
-                stream_server.update_frame("raw_left", left_raw)
-                stream_server.update_frame("raw_right", right_raw)
+                stream_server.update_frame("left", _prep_stream_frame(left_ann if left_ann is not None else depth_res["rect_left"]))
+                stream_server.update_frame("right", _prep_stream_frame(right_ann if right_ann is not None else depth_res["rect_right"]))
+                # Raw full-res only if someone is watching (skip encode cost otherwise)
+                if stream_server.active_clients() > 0:
+                    stream_server.update_frame("raw_left", _prep_stream_frame(left_raw))
+                    stream_server.update_frame("raw_right", _prep_stream_frame(right_raw))
 
                 stream_server.update_status(
                     fps=round(fps_depth, 1),
