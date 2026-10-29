@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 M.A.R. — mar-vision-service Microservice Daemon
-Synchronized stereo acquisition, fast rectification, epipolar alignment, SGBM 3D corridor depth,
-dynamic Auto-Focus obstacle tracking, 2D top-down navigation mapping, YOLO detection,
-interactive multi-stream MJPEG HTTP server, and MQTT autonomous driving publisher.
+
+Realtime architecture (target ≥30 FPS display):
+  • Capture + MJPEG overlay loop never waits on YOLO
+  • Depth worker (StereoBM) runs in parallel; latest result wins
+  • YOLO optional background thread (off by default for max FPS)
 """
 
 import sys
 import time
 import json
 import os
+import threading
 import cv2
 import numpy as np
 
@@ -18,6 +21,12 @@ from camera.stereo_camera import StereoCameraDriver
 from camera.stereo_depth import StereoDepthEstimator
 from detector.yolo_detector import YOLODetector
 from server.mjpeg_server import MultiStreamServer
+from safety_bands import (
+    DIST_CRITICAL_CM,
+    DIST_HIGH_CM,
+    DIST_MODERATE_CM,
+    classify_distance_cm,
+)
 
 try:
     import paho.mqtt.client as mqtt
@@ -26,31 +35,58 @@ except ImportError:
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-# YOLO every N depth frames (1=every frame). On RPi default 3 keeps UI fluid.
-YOLO_STRIDE = max(1, int(os.getenv("MAR_YOLO_STRIDE", "8")))
-# Max width for MJPEG encode (original script used 960)
-STREAM_MAX_W = int(os.getenv("MAR_STREAM_MAX_W", "960"))
+STREAM_MAX_W = int(os.getenv("MAR_STREAM_MAX_W", "640"))
+# YOLO off by default → depth/stream hit camera rate. Set MAR_YOLO_ENABLE=1 to turn on.
+YOLO_ENABLE = os.getenv("MAR_YOLO_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
+YOLO_STRIDE_S = float(os.getenv("MAR_YOLO_PERIOD_S", "1.0"))
+TARGET_STREAM_FPS = float(os.getenv("MAR_TARGET_STREAM_FPS", "30"))
 
 
 def _prep_stream_frame(frame):
-    """Downscale large frames before JPEG encode to cut encode+Tailscale cost."""
     if frame is None:
         return None
     if frame.ndim == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     h, w = frame.shape[:2]
     if w > STREAM_MAX_W:
-        nh = int(h * STREAM_MAX_W / w)
+        nh = max(1, int(h * STREAM_MAX_W / w))
         return cv2.resize(frame, (STREAM_MAX_W, nh), interpolation=cv2.INTER_AREA)
     return frame
+
+
+def _overlay_hud(frame_bgr, dist_cm, cmd, risk, fps_stream, fps_depth):
+    out = frame_bgr
+    color = {
+        "CRITICAL": (0, 0, 255),
+        "HIGH": (0, 128, 255),
+        "MODERATE": (0, 220, 255),
+        "LOW": (0, 220, 0),
+    }.get(risk, (200, 200, 200))
+    lines = [
+        f"{cmd} | {risk} | Z={dist_cm:.0f}cm",
+        f"stream {fps_stream:.0f}fps | depth {fps_depth:.0f}fps",
+        f"bands C<{DIST_CRITICAL_CM:.0f} H<{DIST_HIGH_CM:.0f} M<{DIST_MODERATE_CM:.0f}",
+    ]
+    y = 28
+    for line in lines:
+        cv2.putText(out, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+        y += 28
+    if risk == "CRITICAL":
+        h, w = out.shape[:2]
+        cv2.rectangle(out, (0, 0), (w - 1, h - 1), (0, 0, 255), 6)
+    return out
 
 
 def run_vision_service(config: AppConfig):
     print("=" * 72)
     print("  🐾 M.A.R. — 3D STEREO VISION & AUTONOMOUS DRIVING SERVICE")
     print("=" * 72)
+    print(
+        f"  • Safety bands cm: CRITICAL<{DIST_CRITICAL_CM:.0f}  "
+        f"HIGH<{DIST_HIGH_CM:.0f}  MODERATE<{DIST_MODERATE_CM:.0f}"
+    )
+    print(f"  • Target stream FPS: {TARGET_STREAM_FPS:.0f} | YOLO={'ON' if YOLO_ENABLE else 'OFF'}")
 
-    # 1. Connessione MQTT
     mqtt_client = None
     if mqtt:
         try:
@@ -61,192 +97,277 @@ def run_vision_service(config: AppConfig):
         except Exception as e:
             print(f"  ⚠️ MQTT non disponibile ({e}). Esecuzione standalone.")
 
-    # 2. Hardware Fotocamera Stereo (con thread non bloccante e rotazione 180°)
+    # Force camera toward 30 FPS if config allows
+    try:
+        config.camera.fps = max(int(config.camera.fps), 30)
+    except Exception:
+        pass
+
     camera = StereoCameraDriver(config.camera, upside_down=True)
     if not camera.open():
         print("✗ Impossibile inizializzare la fotocamera stereo.")
         sys.exit(1)
 
-    # 3. Modulo Disparità 3D, Allineamento Epipolare e Mappa Top-Down
     depth_estimator = StereoDepthEstimator(config.depth)
-    print("  ✓ Pipeline 3D SGBM, Auto-Focus Ostacoli & Allineamento Epipolare: ATTIVO")
+    print("  ✓ Pipeline depth realtime ATTIVA")
 
-    # 4. Modello YOLO Edge AI
-    detector = YOLODetector(config.detector)
+    detector = None
+    if YOLO_ENABLE:
+        detector = YOLODetector(config.detector)
+    else:
+        print("  ℹ️ YOLO disabilitato (MAR_YOLO_ENABLE=0) per FPS massimi")
 
-    # 5. Server di Streaming MJPEG & Console Web Interattiva
     stream_server = MultiStreamServer(
         config.stream,
-        command_callback=lambda action, val: depth_estimator.handle_command(action, val)
+        command_callback=lambda action, val: depth_estimator.handle_command(action, val),
     )
     stream_server.start()
 
-    print("\n  🚀 PIPELINE VISIONE ATTIVA")
-    print(f"  📡 Console Web & Streaming: http://{config.stream.host}:{config.stream.port}/")
-    print("========================================================================\n")
+    # Shared state
+    state_lock = threading.Lock()
+    latest = {
+        "depth_res": None,
+        "left_objs": [],
+        "fps_depth": 0.0,
+        "fps_stream": 0.0,
+        "frame_for_yolo": None,
+    }
+    stop_evt = threading.Event()
+    depth_queue: list = []
+    depth_q_lock = threading.Lock()
 
-    fps_depth = 0.0
-    frame_count = 0
-    t_fps_start = time.time()
-    last_mqtt_pub = 0.0
-    loop_i = 0
-    cached_left_ann = None
-    cached_right_ann = None
-    cached_left_objs: list = []
-    print(f"  • YOLO stride: ogni {YOLO_STRIDE} frame | stream max width: {STREAM_MAX_W}px")
-
-    try:
-        while True:
-            # 1. Cattura frame stereo sincronizzato
-            stereo_frame = camera.read(timeout=0.5)
-            if stereo_frame is None:
-                time.sleep(0.005)
+    def depth_worker():
+        fcount = 0
+        t0 = time.time()
+        while not stop_evt.is_set():
+            pair = None
+            with depth_q_lock:
+                if depth_queue:
+                    pair = depth_queue.pop()  # latest only
+                    depth_queue.clear()
+            if pair is None:
+                time.sleep(0.001)
+                continue
+            left_raw, right_raw = pair
+            try:
+                depth_res = depth_estimator.process_stereo_frame(left_raw, right_raw)
+            except Exception as e:
+                print(f"[DEPTH] errore: {e}")
                 continue
 
-            frame_count += 1
-            loop_i += 1
+            fcount += 1
+            now = time.time()
+            if now - t0 >= 1.0:
+                fps_d = fcount / (now - t0)
+                fcount = 0
+                t0 = now
+            else:
+                fps_d = None
+
+            with state_lock:
+                latest["depth_res"] = depth_res
+                if fps_d is not None:
+                    latest["fps_depth"] = fps_d
+                latest["frame_for_yolo"] = depth_res.get("rect_left")
+
+            # MQTT as soon as depth is ready (decision latency)
+            if mqtt_client and mqtt_client.is_connected():
+                dist = float(depth_res["target_dist_cm"])
+                payload = {
+                    "timestamp": now,
+                    "command": depth_res["driving_command"],
+                    "reason": depth_res["driving_reason"],
+                    "risk_level": depth_res.get("risk_level", classify_distance_cm(dist)),
+                    "target_dist_cm": round(dist, 1),
+                    "obstacle_near_cm": round(float(depth_res["obstacle_dist_cm"]), 1)
+                    if depth_res.get("obstacle_found")
+                    else 999.0,
+                    "ground_hazard": depth_res.get("ground_hazard", False),
+                    "z_basso_cm": round(float(depth_res.get("z_basso_cm", 999.0)), 1),
+                    "z_centro_cm": round(float(depth_res.get("z_centro_cm", 999.0)), 1),
+                    "fov_blocked": bool(depth_res.get("fov_blocked", False)),
+                    "safety_alarm": depth_res["safety_alarm"],
+                    "safety_reason": depth_res["safety_reason"],
+                    "bands_cm": depth_res.get("bands_cm", {}),
+                }
+                mqtt_client.publish("mar/vision/command", json.dumps(payload))
+                mqtt_client.publish(
+                    "mar/vision/detections",
+                    json.dumps(
+                        {
+                            "timestamp": now,
+                            "spatial_grid_3d": depth_res.get("spatial_grid_3d", {}),
+                            "z_basso_cm": payload["z_basso_cm"],
+                            "z_centro_cm": payload["z_centro_cm"],
+                            "z_alto_cm": round(float(depth_res.get("z_alto_cm", 999.0)), 1),
+                            "ground_hazard": payload["ground_hazard"],
+                            "target_dist_cm": payload["target_dist_cm"],
+                            "risk_level": payload["risk_level"],
+                            "objects_count": len(latest["left_objs"]),
+                            "objects": [
+                                {
+                                    "class": o.label,
+                                    "confidence": round(float(o.confidence), 2),
+                                    "bbox": [int(x) for x in o.bbox],
+                                }
+                                for o in latest["left_objs"]
+                            ],
+                        }
+                    ),
+                )
+                if payload["ground_hazard"]:
+                    mqtt_client.publish(
+                        "mar/vision/ground_hazard",
+                        json.dumps({"timestamp": now, "hazard": True, "z_basso_cm": payload["z_basso_cm"]}),
+                    )
+                mqtt_client.publish(
+                    "mar/vision/status",
+                    json.dumps(
+                        {
+                            "timestamp": now,
+                            "fps_camera": round(camera.actual_fps, 1),
+                            "fps_depth": round(latest["fps_depth"], 1),
+                            "fps_stream": round(latest["fps_stream"], 1),
+                            "risk_level": payload["risk_level"],
+                            "objects_count": len(latest["left_objs"]),
+                            "objects": [
+                                {
+                                    "class": o.label,
+                                    "confidence": round(float(o.confidence), 2),
+                                    "bbox": [int(x) for x in o.bbox],
+                                }
+                                for o in latest["left_objs"]
+                            ],
+                        }
+                    ),
+                )
+
+    def yolo_worker():
+        if detector is None:
+            return
+        while not stop_evt.is_set():
+            frame = None
+            with state_lock:
+                frame = latest.get("frame_for_yolo")
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            try:
+                ann, objs = detector.detect_single(frame, "LEFT", imgsz=160)
+                with state_lock:
+                    latest["left_objs"] = objs
+                    latest["yolo_ann"] = ann
+            except Exception as e:
+                print(f"[YOLO] {e}")
+            stop_evt.wait(YOLO_STRIDE_S)
+
+    threading.Thread(target=depth_worker, name="depth-worker", daemon=True).start()
+    if detector is not None:
+        threading.Thread(target=yolo_worker, name="yolo-worker", daemon=True).start()
+
+    print("\n  🚀 PIPELINE VISIONE REALTIME")
+    print(f"  📡 Console: http://{config.stream.host}:{config.stream.port}/")
+    print("========================================================================\n")
+
+    stream_count = 0
+    t_stream = time.time()
+    min_dt = 1.0 / max(1.0, TARGET_STREAM_FPS)
+
+    try:
+        while not stop_evt.is_set():
+            t_loop = time.time()
+            stereo_frame = camera.read(timeout=0.5)
+            if stereo_frame is None:
+                time.sleep(0.002)
+                continue
+
             left_raw = stereo_frame.left
             right_raw = stereo_frame.right
 
-            # 2. Pipeline Stereoscopica 3D (Rettificazione, Disparità, Auto-Focus, Mappa, Decisione Guida)
-            depth_res = depth_estimator.process_stereo_frame(left_raw, right_raw)
+            # Feed depth worker (keep only newest)
+            with depth_q_lock:
+                depth_queue.append((left_raw, right_raw))
+                if len(depth_queue) > 1:
+                    depth_queue[:] = depth_queue[-1:]
 
-            composite = depth_res["composite"]
-            map_2d = depth_res["map_2d"]
-            driving_cmd = depth_res["driving_command"]
-            driving_reason = depth_res["driving_reason"]
-            target_dist = depth_res["target_dist_cm"]
-            obs_dist = depth_res["obstacle_dist_cm"] if depth_res["obstacle_found"] else 999.0
-            ground_hazard = (target_dist < 45.0)
+            with state_lock:
+                depth_res = latest.get("depth_res")
+                fps_depth = latest.get("fps_depth", 0.0)
+                yolo_ann = latest.get("yolo_ann")
 
-            # 3. YOLO left-only, throttled — depth/UI stay realtime when you walk in front
-            if (loop_i % YOLO_STRIDE) == 1 or cached_left_ann is None:
-                left_ann, right_ann, left_objs, right_objs = detector.detect_stereo(
-                    depth_res["rect_left"],
-                    depth_res["rect_right"]
-                )
-                cached_left_ann, cached_right_ann = left_ann, right_ann
-                cached_left_objs = left_objs
+            # Fast preview: left eye (+ optional yolo) + HUD from last depth
+            if yolo_ann is not None:
+                preview = yolo_ann
+                if preview.ndim == 2:
+                    preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
             else:
-                left_ann = cached_left_ann
-                right_ann = cached_right_ann
-                left_objs = cached_left_objs
-                right_objs = []
-            all_objects = left_objs + right_objs
+                preview = left_raw
+                if depth_res is not None and depth_res.get("composite") is not None:
+                    # Prefer lightweight composite when available
+                    preview = depth_res["composite"]
 
-            # 4. Pubblicazione Decisione di Guida e Rilevamenti su MQTT
-            now = time.time()
-            if mqtt_client and mqtt_client.is_connected() and (now - last_mqtt_pub > 0.05):
-                last_mqtt_pub = now
+            dist_cm = float(depth_res["target_dist_cm"]) if depth_res else 999.0
+            cmd = depth_res["driving_command"] if depth_res else "…"
+            risk = depth_res.get("risk_level", classify_distance_cm(dist_cm)) if depth_res else "LOW"
+            preview = _overlay_hud(
+                _prep_stream_frame(preview).copy(),
+                dist_cm,
+                cmd,
+                risk,
+                latest.get("fps_stream", 0.0),
+                fps_depth,
+            )
 
-                # Decisione di marcia immediata per mar-decision-engine
-                decision_payload = {
-                    "timestamp": now,
-                    "command": driving_cmd,
-                    "reason": driving_reason,
-                    "target_dist_cm": round(float(target_dist), 1),
-                    "obstacle_near_cm": round(float(obs_dist), 1),
-                    "ground_hazard": depth_res.get("ground_hazard", ground_hazard),
-                    "z_basso_cm": round(float(depth_res.get("z_basso_cm", 999.0)), 1),
-                    "z_centro_cm": round(float(depth_res.get("z_centro_cm", 999.0)), 1),
-                    "safety_alarm": depth_res["safety_alarm"],
-                    "safety_reason": depth_res["safety_reason"]
-                }
-                mqtt_client.publish("mar/vision/command", json.dumps(decision_payload))
-
-                # Griglia 3D, settori spaziali e oggetti per la sensor fusion
-                detections_payload = {
-                    "timestamp": now,
-                    "spatial_grid_3d": depth_res.get("spatial_grid_3d", {}),
-                    "z_basso_cm": round(float(depth_res.get("z_basso_cm", 999.0)), 1),
-                    "z_centro_cm": round(float(depth_res.get("z_centro_cm", 999.0)), 1),
-                    "z_alto_cm": round(float(depth_res.get("z_alto_cm", 999.0)), 1),
-                    "ground_hazard": depth_res.get("ground_hazard", ground_hazard),
-                    "target_dist_cm": round(float(target_dist), 1),
-                    "objects_count": len(all_objects),
-                    "objects": [
-                        {
-                            "class": o.label,
-                            "confidence": round(float(o.confidence), 2),
-                            "bbox": [int(x) for x in o.bbox]
-                        }
-                        for o in left_objs
-                    ]
-                }
-                mqtt_client.publish("mar/vision/detections", json.dumps(detections_payload))
-
-                # Allarme ostacolo a terra se presente
-                if depth_res.get("ground_hazard", False) or ground_hazard:
-                    ground_payload = {
-                        "timestamp": now,
-                        "hazard": True,
-                        "z_basso_cm": round(float(depth_res.get("z_basso_cm", 999.0)), 1)
-                    }
-                    mqtt_client.publish("mar/vision/ground_hazard", json.dumps(ground_payload))
-
-                # Oggetti YOLO e telemetria
-                telemetry_payload = {
-                    "timestamp": now,
-                    "fps_camera": round(camera.actual_fps, 1),
-                    "fps_depth": round(fps_depth, 1),
-                    "objects_count": len(all_objects),
-                    "objects": [
-                        {
-                            "class": o.label,
-                            "confidence": round(float(o.confidence), 2),
-                            "bbox": [int(x) for x in o.bbox]
-                        }
-                        for o in left_objs
-                    ]
-                }
-                mqtt_client.publish("mar/vision/status", json.dumps(telemetry_payload))
-
-            # 5. Aggiornamento Frame e Telemetria sul Server MJPEG (downscaled JPEG)
             if config.stream.enabled:
-                stream_server.update_frame("composite", _prep_stream_frame(composite))
-                stream_server.update_frame("map", map_2d)
-                stream_server.update_frame("left", _prep_stream_frame(left_ann if left_ann is not None else depth_res["rect_left"]))
-                stream_server.update_frame("right", _prep_stream_frame(right_ann if right_ann is not None else depth_res["rect_right"]))
-                # Raw full-res only if someone is watching (skip encode cost otherwise)
-                if stream_server.active_clients() > 0:
-                    stream_server.update_frame("raw_left", _prep_stream_frame(left_raw))
-                    stream_server.update_frame("raw_right", _prep_stream_frame(right_raw))
-
+                stream_server.update_frame("composite", preview)
+                stream_server.update_frame("left", preview)
+                if depth_res is not None:
+                    stream_server.update_frame("right", _prep_stream_frame(depth_res.get("rect_right")))
+                    stream_server.update_frame("map", depth_res.get("map_2d"))
                 stream_server.update_status(
-                    fps=round(fps_depth, 1),
+                    fps=round(latest.get("fps_stream", 0.0), 1),
                     fps_camera=round(camera.actual_fps, 1),
                     fps_depth=round(fps_depth, 1),
-                    modo=depth_res["current_mode"],
-                    auto_switch=depth_res["auto_switch"],
-                    offset_x=depth_res["offset_x"],
-                    offset_y=depth_res["offset_y"],
-                    decisione_guida=driving_cmd,
-                    motivo_guida=driving_reason,
-                    ostacolo_centrale_cm=round(float(target_dist), 1),
-                    ostacolo_vicino_cm=round(float(obs_dist), 1),
-                    ground_hazard=ground_hazard,
-                    allarme_lenti=depth_res["safety_alarm"],
-                    allarme_motivo=depth_res["safety_reason"],
-                    model=detector.model_name,
-                    detections_count=len(all_objects)
+                    modo=depth_res["current_mode"] if depth_res else 1,
+                    auto_switch=depth_res["auto_switch"] if depth_res else True,
+                    offset_x=depth_res["offset_x"] if depth_res else 0,
+                    offset_y=depth_res["offset_y"] if depth_res else 0,
+                    decisione_guida=cmd,
+                    motivo_guida=depth_res["driving_reason"] if depth_res else "",
+                    risk_level=risk,
+                    ostacolo_centrale_cm=round(dist_cm, 1),
+                    ostacolo_vicino_cm=round(float(depth_res["obstacle_dist_cm"]), 1)
+                    if depth_res and depth_res.get("obstacle_found")
+                    else 999.0,
+                    ground_hazard=bool(depth_res.get("ground_hazard", False)) if depth_res else False,
+                    allarme_lenti=depth_res["safety_alarm"] if depth_res else False,
+                    allarme_motivo=depth_res["safety_reason"] if depth_res else "",
+                    model=("YOLOV8N" if detector else "OFF"),
+                    detections_count=len(latest.get("left_objs") or []),
+                    bands_cm={
+                        "critical": DIST_CRITICAL_CM,
+                        "high": DIST_HIGH_CM,
+                        "moderate": DIST_MODERATE_CM,
+                    },
                 )
 
-            # 6. Finestra GUI locale se non headless
-            if not config.headless:
-                cv2.imshow("M.A.R. Vision Service Monitor", composite)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
+            stream_count += 1
+            now = time.time()
+            if now - t_stream >= 1.0:
+                with state_lock:
+                    latest["fps_stream"] = stream_count / (now - t_stream)
+                stream_count = 0
+                t_stream = now
 
-            # 7. Calcolo FPS
-            if time.time() - t_fps_start >= 1.0:
-                fps_depth = frame_count / (time.time() - t_fps_start)
-                frame_count = 0
-                t_fps_start = time.time()
+            # Pace toward target stream FPS (don't spin hotter than needed)
+            elapsed = time.time() - t_loop
+            if elapsed < min_dt:
+                time.sleep(min_dt - elapsed)
 
     except KeyboardInterrupt:
         print("\nArresto manuale richiesto...")
     finally:
+        stop_evt.set()
         print("\n[CLEANUP] Rilascio risorse telecamera e server...")
         stream_server.stop()
         camera.release()
@@ -255,6 +376,9 @@ def run_vision_service(config: AppConfig):
 
 def main():
     config = parse_cli_arguments()
+    # Prefer headless + lower jpeg for speed on edge
+    config.headless = True
+    config.stream.jpeg_quality = min(int(config.stream.jpeg_quality), 65)
     run_vision_service(config)
 
 

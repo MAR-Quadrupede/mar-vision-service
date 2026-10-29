@@ -17,8 +17,10 @@ import numpy as np
 
 try:
     from ..config import DepthConfig
+    from ..safety_bands import command_for_distance_cm, DIST_CRITICAL_CM, DIST_HIGH_CM, DIST_MODERATE_CM
 except (ImportError, ValueError):
     from config import DepthConfig
+    from safety_bands import command_for_distance_cm, DIST_CRITICAL_CM, DIST_HIGH_CM, DIST_MODERATE_CM
 
 
 # Parametri geometrici e soglie rover M.A.R.
@@ -140,19 +142,34 @@ class StereoDepthEstimator:
         # Carica calibrazione NPZ e calcola mappe veloci
         self._load_calibration()
 
-        # Stereo Matcher SGBM
-        self.stereo = cv2.StereoSGBM_create(
-            minDisparity=0,
-            numDisparities=NUM_DISPARITIES,
-            blockSize=SGBM_BLOCK,
-            P1=8 * 3 * SGBM_BLOCK ** 2,
-            P2=32 * 3 * SGBM_BLOCK ** 2,
-            disp12MaxDiff=1,
-            uniquenessRatio=15,
-            speckleWindowSize=100,
-            speckleRange=2,
-            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
-        )
+        # Su ARM: StereoBM (molto più veloce). Su x86: SGBM di qualità.
+        use_bm = IS_ARM or os.getenv("MAR_STEREO_BM", "0").strip() in ("1", "true", "yes")
+        if use_bm:
+            bm_block = 15 if SGBM_DIV >= 4 else 11
+            self.stereo = cv2.StereoBM_create(
+                numDisparities=NUM_DISPARITIES,
+                blockSize=bm_block,
+            )
+            self.stereo.setPreFilterCap(31)
+            self.stereo.setTextureThreshold(8)
+            self.stereo.setUniquenessRatio(10)
+            self.stereo.setSpeckleWindowSize(50)
+            self.stereo.setSpeckleRange(2)
+            print(f"  ✓ [DEPTH] Matcher=StereoBM block={bm_block} (fast path)")
+        else:
+            self.stereo = cv2.StereoSGBM_create(
+                minDisparity=0,
+                numDisparities=NUM_DISPARITIES,
+                blockSize=SGBM_BLOCK,
+                P1=8 * 3 * SGBM_BLOCK ** 2,
+                P2=32 * 3 * SGBM_BLOCK ** 2,
+                disp12MaxDiff=1,
+                uniquenessRatio=15,
+                speckleWindowSize=100,
+                speckleRange=2,
+                mode=cv2.STEREO_SGBM_MODE_HH,
+            )
+            print("  ✓ [DEPTH] Matcher=StereoSGBM HH")
 
         # Stato modalità video (0=Mix fisso, 1=Nitida, 2=Depth, 3=Auto-Focus)
         self.modalita_vista = 3
@@ -352,12 +369,25 @@ class StereoDepthEstimator:
         if self.has_calibration and self.M_epi is not None:
             gs_R = cv2.warpAffine(gs_R, self.M_epi, (gs_R.shape[1], gs_R.shape[0]))
 
-        # Disparità SGBM
+        # Disparità (BM o SGBM). OpenCV restituisce fixed-point ×16.
         disp_small = self.stereo.compute(gs_L, gs_R).astype(np.float32) / 16.0
 
-        # Filtro texture Sobel: azzera regioni prive di contrasto (evita falsi ostacoli su pavimenti/muri lisci)
+        # Texture filter: più permissivo al centro (foglio/mano vicini hanno poca texture)
         gx = cv2.Sobel(gs_L, cv2.CV_16S, 1, 0, ksize=3)
-        disp_small[cv2.blur(np.abs(gx).astype(np.float32), (5, 5)) < TEX_MIN] = -1.0
+        tex = cv2.blur(np.abs(gx).astype(np.float32), (5, 5))
+        hh_s, ww_s = tex.shape[:2]
+        tex_thr = np.full_like(tex, TEX_MIN)
+        tex_thr[int(hh_s * 0.25):int(hh_s * 0.85), int(ww_s * 0.2):int(ww_s * 0.8)] = max(1.2, TEX_MIN * 0.35)
+        disp_small[tex < tex_thr] = -1.0
+
+        # FOV bloccato (foglio/mano che riempie l'inquadratura senza texture):
+        # se il corridoio centrale è quasi tutto invalido → tratta come ostacolo CRITICAL.
+        c0, c1 = int(ww_s * 0.25), int(ww_s * 0.75)
+        r0, r1 = int(hh_s * 0.28), int(hh_s * 0.85)
+        center_disp = disp_small[r0:r1, c0:c1]
+        center_tex = tex[r0:r1, c0:c1]
+        invalid_ratio = 1.0 - (np.count_nonzero(center_disp > 0) / max(1, center_disp.size))
+        fov_blocked = bool(invalid_ratio > 0.55 and float(center_tex.mean()) < (TEX_MIN * 1.8))
 
         # 3. Diagnostica sicurezza lenti
         motivo_sic = self.valuta_sicurezza_lenti(gs_L, gs_R)
@@ -492,6 +522,12 @@ class StereoDepthEstimator:
         else:
             distanza_fronte_cm = 230.0
 
+        # Foglio/parete textureless a contatto: forza distanza CRITICAL
+        if fov_blocked:
+            distanza_fronte_cm = min(distanza_fronte_cm, DIST_CRITICAL_CM * 0.75)
+            dist_ostacolo_cm = min(dist_ostacolo_cm, DIST_CRITICAL_CM * 0.75)
+            ostacolo_trovato = True
+
         # Filtro passa-basso sull'autofocus
         self.offset_autofocus_smooth = 0.70 * self.offset_autofocus_smooth + 0.30 * offset_target
         offset_autofocus_x = int(round(self.offset_autofocus_smooth))
@@ -548,19 +584,20 @@ class StereoDepthEstimator:
             )
             mappa_navigazione[mappa_z_pixel[validi_a_schermo], mappa_x_pixel[validi_a_schermo]] = [0, 0, 255]
 
-        # 6. Logica di guida e collision avoidance
-        ostacoli_centrali = (X_ostacoli > -20.0) & (X_ostacoli < 20.0) & (Z_ostacoli < 120.0)
+        # 6. Logica di guida — SOLO sulla distanza frontale (bande unificate)
+        ostacoli_centrali = (X_ostacoli > -20.0) & (X_ostacoli < 20.0) & (Z_ostacoli < DIST_MODERATE_CM)
         punti_pericolo = int(np.sum(ostacoli_centrali))
+        dist_decision = float(distanza_per_switch)
 
         if self.allarme_sic:
             comando = "STOP"
             motivo_cmd = f"SICUREZZA: {self.motivo_allarme}"
-        elif punti_pericolo > 7500:
-            comando = "FRENA"
-            motivo_cmd = f"Ostacolo a meno di 120 cm ({punti_pericolo} punti)"
+            risk_level = "CRITICAL"
         else:
-            comando = "AVANTI"
-            motivo_cmd = f"Strada libera ({distanza_per_switch:.0f} cm)"
+            comando, motivo_cmd, risk_level = command_for_distance_cm(dist_decision)
+            if fov_blocked and risk_level != "CRITICAL":
+                comando, motivo_cmd, risk_level = command_for_distance_cm(DIST_CRITICAL_CM * 0.75)
+                motivo_cmd = f"CRITICAL: FOV ostruito (foglio/ostacolo vicino) | {motivo_cmd}"
 
         # 7. Rendering delle modalità video (raddrizzate 180° per correggere il montaggio)
         flip_L = cv2.flip(rect_L, -1)
@@ -574,12 +611,12 @@ class StereoDepthEstimator:
             else:
                 shifted_R = flip_R
             blend = cv2.addWeighted(flip_L, 0.5, shifted_R, 0.5, 0)
-            composite_view = cv2.cvtColor(cv2.medianBlur(blend, 5), cv2.COLOR_GRAY2BGR)
+            composite_view = cv2.cvtColor(blend, cv2.COLOR_GRAY2BGR)
             titolo_modo = "Mix Stereo 50/50 (Fisso)"
 
         elif self.modalita_vista == 1:
-            # Modo 1: Nitida FPV monoculare principale
-            composite_view = cv2.cvtColor(cv2.medianBlur(flip_L, 3), cv2.COLOR_GRAY2BGR)
+            # Modo 1: Nitida FPV monoculare principale (path più veloce)
+            composite_view = cv2.cvtColor(flip_L, cv2.COLOR_GRAY2BGR)
             titolo_modo = "Camera Principale (Nitida FPV)"
 
         elif self.modalita_vista == 2:
@@ -599,7 +636,7 @@ class StereoDepthEstimator:
             else:
                 shifted_R = flip_R
             blend = cv2.addWeighted(flip_L, 0.5, shifted_R, 0.5, 0)
-            composite_view = cv2.cvtColor(cv2.medianBlur(blend, 5), cv2.COLOR_GRAY2BGR)
+            composite_view = cv2.cvtColor(blend, cv2.COLOR_GRAY2BGR)
             titolo_modo = "Auto-Focus Ostacolo (Modo 3)"
 
             if ostacolo_trovato and bbox_ostacolo is not None:
@@ -660,9 +697,16 @@ class StereoDepthEstimator:
             "offset_y": self.offset_y,
             "driving_command": comando,
             "driving_reason": motivo_cmd,
+            "risk_level": risk_level,
+            "fov_blocked": fov_blocked,
             "safety_alarm": self.allarme_sic,
             "safety_reason": self.motivo_allarme,
-            "danger_points": punti_pericolo
+            "danger_points": punti_pericolo,
+            "bands_cm": {
+                "critical": DIST_CRITICAL_CM,
+                "high": DIST_HIGH_CM,
+                "moderate": DIST_MODERATE_CM,
+            },
         }
 
     def set_mode(self, mode: int):
