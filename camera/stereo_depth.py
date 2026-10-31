@@ -17,10 +17,20 @@ import numpy as np
 
 try:
     from ..config import DepthConfig
-    from ..safety_bands import command_for_distance_cm, DIST_CRITICAL_CM, DIST_HIGH_CM, DIST_MODERATE_CM
+    from ..safety_bands import (
+        RiskDecisionStabilizer,
+        DIST_CRITICAL_CM,
+        DIST_HIGH_CM,
+        DIST_MODERATE_CM,
+    )
 except (ImportError, ValueError):
     from config import DepthConfig
-    from safety_bands import command_for_distance_cm, DIST_CRITICAL_CM, DIST_HIGH_CM, DIST_MODERATE_CM
+    from safety_bands import (
+        RiskDecisionStabilizer,
+        DIST_CRITICAL_CM,
+        DIST_HIGH_CM,
+        DIST_MODERATE_CM,
+    )
 
 
 # Parametri geometrici e soglie rover M.A.R.
@@ -31,20 +41,21 @@ IS_ARM = any(tag in platform.machine().lower() for tag in ("arm", "aarch64"))
 FRAME_W_ATTESO, FRAME_H_ATTESO = 2560, 800
 SGBM_DIV = int(os.getenv("MAR_SGBM_DIV", "4" if IS_ARM else "2"))
 RECT_DIV = int(os.getenv("MAR_RECT_DIV", "2" if IS_ARM else "1"))
-NUM_DISPARITIES = int(os.getenv("MAR_NUM_DISPARITIES", "96" if SGBM_DIV >= 4 else "64"))
-SGBM_BLOCK = 5 if SGBM_DIV >= 4 else 5
+NUM_DISPARITIES = int(os.getenv("MAR_NUM_DISPARITIES", "96" if SGBM_DIV >= 4 else "192"))
+SGBM_BLOCK = 5 if SGBM_DIV >= 4 else 7
 VS = 1.0 / RECT_DIV
 STEP_SUB = max(1, 4 // max(1, SGBM_DIV))
-TEX_MIN = 3.5
+# Soglia gradiente Sobel anti-falsi ostacoli su pareti lisce e pavimenti (1.5 per non scartare pareti indoor reali)
+TEX_MIN = float(os.getenv("MAR_TEX_MIN", "1.5"))
 
 # Limiti corridoio rover (camera montata sottosopra)
-ALTEZZA_MIN_ROBOT = -30.0  # cm
+ALTEZZA_MIN_ROBOT = -25.0  # cm
 ALTEZZA_MAX_ROBOT = 25.0   # cm
-MAX_DIST_CM = 240.0
-SOGLIA_DISTANZA_CM = 200.0 # 2.0m soglia auto-switch
+MAX_DIST_CM = 300.0        # cm
+SOGLIA_DISTANZA_CM = 200.0 # 2.0m soglia auto-switch Modo 0 -> Modo 3
 ISTERESI_CM = 15.0
 DENSITA_MIN = 0.5
-MIN_AREA_BLOB = 8
+MIN_AREA_BLOB = 60         # Componente connessa minima (anti-rumore)
 
 # Mappa navigazione top-down
 MAP_SIZE = 450
@@ -136,14 +147,17 @@ class StereoDepthEstimator:
         self.map_R_2 = None
         self.Q = np.eye(4, dtype=np.float64)
         self.Q_veloce = np.eye(4, dtype=np.float64)
-        self.dy_epi = 0.0
-        self.M_epi = np.float32([[1, 0, 0], [0, 1, 0]])
+        # Sfasamento verticale epipolare: default calibrato su rover -28.0px (coerente con calibrazione_offset.json)
+        self.dy_epi = float(os.getenv("MAR_EPI_DY", "-28.0"))
+        self.M_epi = np.float32([[1, 0, 0], [0, 1, self.dy_epi / SGBM_DIV]])
+        self._dy_samples: List[float] = []
+        self._dy_calibrated: bool = False
 
         # Carica calibrazione NPZ e calcola mappe veloci
         self._load_calibration()
 
-        # Su ARM: StereoBM (molto più veloce). Su x86: SGBM di qualità.
-        use_bm = IS_ARM or os.getenv("MAR_STEREO_BM", "0").strip() in ("1", "true", "yes")
+        # Matcher stereoscopico: StereoSGBM 3-WAY calibrato di Ferraresso (affidabile e veloce su 320x200)
+        use_bm = os.getenv("MAR_STEREO_BM", "0").strip() in ("1", "true", "yes")
         if use_bm:
             bm_block = 15 if SGBM_DIV >= 4 else 11
             self.stereo = cv2.StereoBM_create(
@@ -151,8 +165,8 @@ class StereoDepthEstimator:
                 blockSize=bm_block,
             )
             self.stereo.setPreFilterCap(31)
-            self.stereo.setTextureThreshold(8)
-            self.stereo.setUniquenessRatio(10)
+            self.stereo.setTextureThreshold(int(os.getenv("MAR_BM_TEX_THR", "3")))
+            self.stereo.setUniquenessRatio(int(os.getenv("MAR_BM_UNIQUENESS", "7")))
             self.stereo.setSpeckleWindowSize(50)
             self.stereo.setSpeckleRange(2)
             print(f"  ✓ [DEPTH] Matcher=StereoBM block={bm_block} (fast path)")
@@ -167,9 +181,9 @@ class StereoDepthEstimator:
                 uniquenessRatio=15,
                 speckleWindowSize=100,
                 speckleRange=2,
-                mode=cv2.STEREO_SGBM_MODE_HH,
+                mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
             )
-            print("  ✓ [DEPTH] Matcher=StereoSGBM HH")
+            print(f"  ✓ [DEPTH] Matcher=StereoSGBM 3-WAY (disp={NUM_DISPARITIES}, block={SGBM_BLOCK}, dy={self.dy_epi:+.1f}px)")
 
         # Stato modalità video (0=Mix fisso, 1=Nitida, 2=Depth, 3=Auto-Focus)
         self.modalita_vista = 3
@@ -185,6 +199,11 @@ class StereoDepthEstimator:
         self.motivo_allarme = ""
         self.comando_prec = "STOP"
         self.t_ultimo_frame = time.time()
+        # Decisione ponderata: niente LOW↔CRITICAL a ogni frame
+        self.risk_stabilizer = RiskDecisionStabilizer()
+        self._last_diag: Dict[str, Any] = {}
+        self._dist_hist: List[float] = []
+        self._dist_hist_max = int(os.getenv("MAR_DIST_MEDIAN_N", "7"))
 
     def _load_offset_config(self):
         """Carica calibrazione_offset.json se disponibile."""
@@ -268,18 +287,22 @@ class StereoDepthEstimator:
             self.map_L_1, self.map_L_2 = mappe_veloci(map_L_x, map_L_y)
             self.map_R_1, self.map_R_2 = mappe_veloci(map_R_x, map_R_y)
             self.Q = Q
+            # Disparità calcolata a ~eye/SGBM_DIV (poi eventuale STEP_SUB).
+            # Q va scalato sullo STESSO fattore dei pixel di lavoro — NON su RECT_DIV.
+            # Prima: scale=RECT_DIV*STEP_SUB e disp*SGBM_DIV → Z/X inconsistenti (0.5m↔1.7m).
+            scale_q = float(SGBM_DIV) * float(max(1, STEP_SUB))
             self.Q_veloce = Q.copy()
-            # Q_veloce: griglia dopo STEP_SUB rispetto alla risoluzione di lavoro
-            scale_q = float(RECT_DIV * max(1, STEP_SUB))
-            self.Q_veloce[0, 3] /= scale_q
-            self.Q_veloce[1, 3] /= scale_q
+            self.Q_veloce[0, 3] /= scale_q  # cx
+            self.Q_veloce[1, 3] /= scale_q  # cy
+            self.Q_veloce[2, 3] /= scale_q  # f  (disparity resta in pixel della griglia ridotta)
             self.has_calibration = True
+            self._q_scale = scale_q
 
             f_px = abs(Q[2, 3])
             baseline_cm = (1.0 / abs(Q[3, 2])) / 10.0 if abs(Q[3, 2]) > 1e-6 else 6.0
             print(
                 f"  ✓ [DEPTH] Calibrazione {calib_file.name}: Focale={f_px:.1f}px, Base={baseline_cm:.1f}cm | "
-                f"ARM={IS_ARM} RECT_DIV={RECT_DIV} SGBM_DIV={SGBM_DIV} numDisp={NUM_DISPARITIES}"
+                f"ARM={IS_ARM} RECT_DIV={RECT_DIV} SGBM_DIV={SGBM_DIV} Q_scale={scale_q:.0f} numDisp={NUM_DISPARITIES}"
             )
 
         except Exception as e:
@@ -310,17 +333,18 @@ class StereoDepthEstimator:
 
         for i, (m, sd, gr) in enumerate(misure):
             nome = f"LENTE {i + 1}"
-            if m < SIC_BUIO_MEDIA:
-                return f"{nome} oscurata (immagine nera)"
-            if m > SIC_SATURO_MEDIA and sd < 8.0:
+            if m < 6.0:
+                return f"{nome} oscurata (immagine completamente nera)"
+            if m > 250.0 and sd < 3.0:
                 return f"{nome} saturata (immagine bianca)"
-            if sd < SIC_UNIFORME_STD and gr < SIC_UNIFORME_GRAD:
-                return f"{nome} coperta (immagine uniforme)"
+            # Allarme coperta solo se deviazione standard microscopica (oggetto piatto premuto sulla lente)
+            if sd < 2.0 and gr < 0.8 and m > 30.0:
+                return f"{nome} coperta da ostacolo cieco"
 
         (m1, _, g1), (m2, _, g2) = misure
-        if abs(m1 - m2) > SIC_ASIMMETRIA_LUMINOSITA:
+        if abs(m1 - m2) > 65.0:
             return "luminosita' asimmetrica tra le lenti (una coperta?)"
-        if max(g1, g2) > 6.0 and max(g1, g2) / max(min(g1, g2), 0.5) > SIC_ASIMMETRIA_TEXTURE:
+        if max(g1, g2) > 8.0 and max(g1, g2) / max(min(g1, g2), 0.5) > 6.0:
             return "una lente vede meno dettaglio dell'altra"
         return None
 
@@ -366,28 +390,48 @@ class StereoDepthEstimator:
         else:
             gs_L, gs_R = rect_L, rect_R
 
+        # Auto-allineamento verticale epipolare nei primi frame (come stereovisione_robot.4py.py)
+        if not self._dy_calibrated and len(self._dy_samples) < 12 and self.has_calibration:
+            v_est = stima_dy_epipolare(rect_L, rect_R)
+            if v_est is not None:
+                self._dy_samples.append(float(v_est))
+                if len(self._dy_samples) >= 3 and (max(self._dy_samples) - min(self._dy_samples)) < 6.0:
+                    self.dy_epi = float(np.median(self._dy_samples))
+                    self.M_epi = np.float32([[1, 0, 0], [0, 1, self.dy_epi / SGBM_DIV]])
+                    self._dy_calibrated = True
+                    print(f"  ✓ [DEPTH] Sfasamento verticale stimato e sincronizzato: {self.dy_epi:+.1f}px")
+
         if self.has_calibration and self.M_epi is not None:
             gs_R = cv2.warpAffine(gs_R, self.M_epi, (gs_R.shape[1], gs_R.shape[0]))
 
         # Disparità (BM o SGBM). OpenCV restituisce fixed-point ×16.
         disp_small = self.stereo.compute(gs_L, gs_R).astype(np.float32) / 16.0
+        # Elimina picco di saturazione / bezel ai bordi
+        disp_small[disp_small >= (NUM_DISPARITIES - 4.0)] = -1.0
 
-        # Texture filter: più permissivo al centro (foglio/mano vicini hanno poca texture)
+        # Texture filter: scarta regioni senza gradiente per evitare falsi ostacoli
         gx = cv2.Sobel(gs_L, cv2.CV_16S, 1, 0, ksize=3)
         tex = cv2.blur(np.abs(gx).astype(np.float32), (5, 5))
         hh_s, ww_s = tex.shape[:2]
-        tex_thr = np.full_like(tex, TEX_MIN)
-        tex_thr[int(hh_s * 0.25):int(hh_s * 0.85), int(ww_s * 0.2):int(ww_s * 0.8)] = max(1.2, TEX_MIN * 0.35)
-        disp_small[tex < tex_thr] = -1.0
+        disp_small[tex < TEX_MIN] = -1.0
 
-        # FOV bloccato (foglio/mano che riempie l'inquadratura senza texture):
-        # se il corridoio centrale è quasi tutto invalido → tratta come ostacolo CRITICAL.
+        # FOV bloccato = foglio/mano che tappa TUTTA l'inquadratura (quasi uniforme).
+        # NON usare solo il centro: un corridoio scuro / porta senza texture dava falsi CRITICAL.
         c0, c1 = int(ww_s * 0.25), int(ww_s * 0.75)
         r0, r1 = int(hh_s * 0.28), int(hh_s * 0.85)
         center_disp = disp_small[r0:r1, c0:c1]
         center_tex = tex[r0:r1, c0:c1]
         invalid_ratio = 1.0 - (np.count_nonzero(center_disp > 0) / max(1, center_disp.size))
-        fov_blocked = bool(invalid_ratio > 0.55 and float(center_tex.mean()) < (TEX_MIN * 1.8))
+        full_tex = float(tex.mean())
+        full_std = float(gs_L.std())
+        full_mean = float(gs_L.mean())
+        # Blocco FOV reale (mano/cartone premuto contro la camera)
+        fov_blocked = bool(
+            invalid_ratio > 0.95
+            and float(center_tex.mean()) < 1.0
+            and full_std < 4.0
+            and (full_mean > 40.0)
+        )
 
         # 3. Diagnostica sicurezza lenti
         motivo_sic = self.valuta_sicurezza_lenti(gs_L, gs_R)
@@ -420,8 +464,12 @@ class StereoDepthEstimator:
             self.motivo_allarme = ""
 
         # 4. Ripenetrazione spaziale 3D nel corridoio utile
-        disparity_veloce = disp_small[::STEP_SUB, ::STEP_SUB] * float(SGBM_DIV)
-        punti_3d = cv2.reprojectImageTo3D(disparity_veloce, self.Q_veloce)
+        # Disparità scalata in pixel pieni (allineata a Q_veloce / 4)
+        disparity_veloce = disp_small[::STEP_SUB, ::STEP_SUB].astype(np.float32) * float(SGBM_DIV)
+        Q_veloce = self.Q.copy()
+        Q_veloce[0, 3] /= 4.0
+        Q_veloce[1, 3] /= 4.0
+        punti_3d = cv2.reprojectImageTo3D(disparity_veloce, Q_veloce)
         punti_3d_cm = punti_3d / 10.0
         H_vel, W_vel = disparity_veloce.shape[:2]
 
@@ -444,8 +492,8 @@ class StereoDepthEstimator:
                 roi_X = punti_robot_cm[r * h_step:(r + 1) * h_step, c * w_step:(c + 1) * w_step, 0]
                 roi_Y = punti_robot_cm[r * h_step:(r + 1) * h_step, c * w_step:(c + 1) * w_step, 1]
 
-                valid_grid = (roi_Z > 10.0) & (roi_Z <= 400.0) & np.isfinite(roi_Z)
-                if np.count_nonzero(valid_grid) > 8:
+                valid_grid = (roi_Z > 20.0) & (roi_Z <= 450.0) & np.isfinite(roi_Z)
+                if np.count_nonzero(valid_grid) > 12:
                     z_vals = roi_Z[valid_grid]
                     q_l, q_h = np.percentile(z_vals, [15, 85])
                     filt_grid = (roi_Z >= q_l) & (roi_Z <= q_h) & valid_grid
@@ -454,6 +502,8 @@ class StereoDepthEstimator:
                         m_x = float(np.median(roi_X[filt_grid]))
                         m_y = float(np.median(roi_Y[filt_grid]))
                         spatial_grid_3d[nome_settore] = (round(m_x, 1), round(m_y, 1), round(m_z, 1))
+                if nome_settore not in spatial_grid_3d:
+                    spatial_grid_3d[nome_settore] = (0.0, 0.0, 999.0)
 
         z_basso_cm = spatial_grid_3d.get("Basso_Centro", (0.0, 0.0, 999.0))[2]
         z_centro_cm = spatial_grid_3d.get("Centro_Centro", (0.0, 0.0, 999.0))[2]
@@ -465,14 +515,16 @@ class StereoDepthEstimator:
         r_utile_min = int(H_vel * 0.28)
         r_utile_max = int(H_vel * 0.85)
 
+        # Corridoio nel FRAME ROBOT (non nel cloud grezzo non-flippato)
+        roi_robot = punti_robot_cm[r_utile_min:r_utile_max, :, :]
         mask_corridoio = (
-            (punti_3d_cm[r_utile_min:r_utile_max, :, 2] > 20.0) &
-            (punti_3d_cm[r_utile_min:r_utile_max, :, 2] < 195.0) &
-            (np.abs(punti_3d_cm[r_utile_min:r_utile_max, :, 0]) < 40.0) &
-            (punti_3d_cm[r_utile_min:r_utile_max, :, 1] > ALTEZZA_MIN_ROBOT) &
-            (punti_3d_cm[r_utile_min:r_utile_max, :, 1] < ALTEZZA_MAX_ROBOT) &
-            np.isfinite(punti_3d_cm[r_utile_min:r_utile_max, :, 2]) &
-            (disparity_veloce[r_utile_min:r_utile_max, :] > 0.0)
+            (roi_robot[:, :, 2] > 25.0) &
+            (roi_robot[:, :, 2] < 220.0) &
+            (np.abs(roi_robot[:, :, 0]) < 35.0) &
+            (roi_robot[:, :, 1] > ALTEZZA_MIN_ROBOT) &
+            (roi_robot[:, :, 1] < ALTEZZA_MAX_ROBOT) &
+            np.isfinite(roi_robot[:, :, 2]) &
+            (disparity_veloce[r_utile_min:r_utile_max, :] > 0.5)
         )
         mask_corridoio = filtra_densita(mask_corridoio)
 
@@ -482,10 +534,10 @@ class StereoDepthEstimator:
         offset_target = float(self.offset_x)
 
         if np.sum(mask_corridoio) > 15:
-            z_ostacoli_corridoio = punti_3d_cm[r_utile_min:r_utile_max, :, 2][mask_corridoio]
-            z_min_ostacolo = float(np.percentile(z_ostacoli_corridoio, 20))
+            z_ostacoli_corridoio = roi_robot[:, :, 2][mask_corridoio]
+            z_min_ostacolo = float(np.percentile(z_ostacoli_corridoio, 15))
 
-            mask_target = mask_corridoio & (punti_3d_cm[r_utile_min:r_utile_max, :, 2] <= (z_min_ostacolo + 30.0))
+            mask_target = mask_corridoio & (roi_robot[:, :, 2] <= (z_min_ostacolo + 35.0))
             blob = isola_blob_compatto(mask_target)
             if blob is not None:
                 sub_rows, cols_obs = np.where(blob)
@@ -493,47 +545,63 @@ class StereoDepthEstimator:
 
                 if len(rows_obs) >= 12:
                     ostacolo_trovato = True
-                    dist_ostacolo_cm = float(np.median(punti_3d_cm[r_utile_min:r_utile_max, :, 2][blob]))
+                    dist_ostacolo_cm = float(np.median(roi_robot[:, :, 2][blob]))
                     disp_mediana_obs = float(np.median(disparity_veloce[r_utile_min:r_utile_max, :][blob]))
 
-                    # Coordinate bounding box nel frame ruotato 180°
+                    # BBox nel frame eye (robot upright = già flip camera): scala griglia → eye
+                    scale_px = float(SGBM_DIV) * float(max(1, STEP_SUB))
                     r_min, r_max = int(np.min(rows_obs)), int(np.max(rows_obs))
                     c_min, c_max = int(np.min(cols_obs)), int(np.max(cols_obs))
-
-                    bx1 = max(0, self.w_eye - 1 - ((c_max + 1) * 4))
-                    bx2 = min(self.w_eye - 1, self.w_eye - 1 - (c_min * 4))
-                    by1 = max(0, self.h_eye - 1 - ((r_max + 1) * 4))
-                    by2 = min(self.h_eye - 1, self.h_eye - 1 - (r_min * 4))
+                    bx1 = max(0, int(c_min * scale_px))
+                    bx2 = min(self.w_eye - 1, int((c_max + 1) * scale_px))
+                    by1 = max(0, int(r_min * scale_px))
+                    by2 = min(self.h_eye - 1, int((r_max + 1) * scale_px))
                     bbox_ostacolo = (bx1, by1, bx2, by2)
 
                     # Autofocus stereoscopico esatto: sposta R di -disp_mediana_obs
                     offset_target = float(np.clip(-disp_mediana_obs, -120.0, 40.0))
 
-        # Stima parete frontale o fondo campo
-        c_roi_inizio = int(W_vel * 0.25)
-        c_roi_fine = int(W_vel * 0.75)
-        roi_centrale_z = punti_3d_cm[r_utile_min:r_utile_max, c_roi_inizio:c_roi_fine, 2]
-        valide_centrale = roi_centrale_z[(roi_centrale_z > 30.0) & (roi_centrale_z < MAX_DIST_CM) & np.isfinite(roi_centrale_z)]
+        # Stima parete frontale (frame robot, ROI centrale)
+        c_roi_inizio = int(W_vel * 0.30)
+        c_roi_fine = int(W_vel * 0.70)
+        roi_centrale_z = punti_robot_cm[r_utile_min:r_utile_max, c_roi_inizio:c_roi_fine, 2]
+        valide_centrale = roi_centrale_z[
+            (roi_centrale_z > 30.0) & (roi_centrale_z < MAX_DIST_CM) & np.isfinite(roi_centrale_z)
+        ]
 
-        if len(valide_centrale) > 15:
-            distanza_fronte_cm = float(np.median(valide_centrale))
+        if len(valide_centrale) > 20:
+            # 25° percentile: reattivo agli ostacoli, meno rumore del min assoluto
+            distanza_fronte_cm = float(np.percentile(valide_centrale, 25))
         elif ostacolo_trovato:
             distanza_fronte_cm = dist_ostacolo_cm
         else:
             distanza_fronte_cm = 230.0
 
-        # Foglio/parete textureless a contatto: forza distanza CRITICAL
-        if fov_blocked:
-            distanza_fronte_cm = min(distanza_fronte_cm, DIST_CRITICAL_CM * 0.75)
-            dist_ostacolo_cm = min(dist_ostacolo_cm, DIST_CRITICAL_CM * 0.75)
+        # FOV ostruito vero (foglio): solo se NON abbiamo già una distanza stereo affidabile.
+        # Altrimenti un false-positive FOV bloccava CRITICAL a 30cm su stanze normali.
+        has_trustworthy_z = bool(
+            ostacolo_trovato and 15.0 < float(dist_ostacolo_cm) < 220.0
+        ) or bool(25.0 < float(distanza_fronte_cm) < 220.0 and len(valide_centrale) > 15)
+        fov_for_decision = bool(fov_blocked) and not has_trustworthy_z
+        if fov_for_decision:
             ostacolo_trovato = True
 
         # Filtro passa-basso sull'autofocus
         self.offset_autofocus_smooth = 0.70 * self.offset_autofocus_smooth + 0.30 * offset_target
         offset_autofocus_x = int(round(self.offset_autofocus_smooth))
 
-        # Auto-switch tra Modo 0 e Modo 3
-        distanza_per_switch = dist_ostacolo_cm if ostacolo_trovato else distanza_fronte_cm
+        # Distanza grezza: preferisci blob ostacolo; altrimenti fronte.
+        # Mediana su N frame → niente salti 50↔230 che tengono HIGH bloccato.
+        distanza_instant = float(dist_ostacolo_cm if ostacolo_trovato else distanza_fronte_cm)
+        # Non avvelenare lo storico con il sentinel "vuoto" (230) se poco prima c'era un ostacolo
+        if distanza_instant >= 220.0 and any(d < 150.0 for d in self._dist_hist[-5:]):
+            pass
+        else:
+            self._dist_hist.append(distanza_instant)
+            if len(self._dist_hist) > self._dist_hist_max:
+                self._dist_hist = self._dist_hist[-self._dist_hist_max:]
+        distanza_raw = float(np.median(np.asarray(self._dist_hist, dtype=np.float64))) if self._dist_hist else distanza_instant
+        distanza_per_switch = float(distanza_raw)
         if self.auto_switch_attivo:
             if distanza_per_switch < SOGLIA_DISTANZA_CM:
                 self.modalita_vista = 3
@@ -584,20 +652,28 @@ class StereoDepthEstimator:
             )
             mappa_navigazione[mappa_z_pixel[validi_a_schermo], mappa_x_pixel[validi_a_schermo]] = [0, 0, 255]
 
-        # 6. Logica di guida — SOLO sulla distanza frontale (bande unificate)
+        # 6. Logica di guida — distanza frontale + decisione ponderata (EMA/isteresi/dwell)
         ostacoli_centrali = (X_ostacoli > -20.0) & (X_ostacoli < 20.0) & (Z_ostacoli < DIST_MODERATE_CM)
         punti_pericolo = int(np.sum(ostacoli_centrali))
-        dist_decision = float(distanza_per_switch)
 
-        if self.allarme_sic:
-            comando = "STOP"
-            motivo_cmd = f"SICUREZZA: {self.motivo_allarme}"
-            risk_level = "CRITICAL"
-        else:
-            comando, motivo_cmd, risk_level = command_for_distance_cm(dist_decision)
-            if fov_blocked and risk_level != "CRITICAL":
-                comando, motivo_cmd, risk_level = command_for_distance_cm(DIST_CRITICAL_CM * 0.75)
-                motivo_cmd = f"CRITICAL: FOV ostruito (foglio/ostacolo vicino) | {motivo_cmd}"
+        comando, motivo_cmd, risk_level, dist_decision = self.risk_stabilizer.update(
+            float(distanza_raw),
+            fov_blocked=bool(fov_for_decision),
+            safety_alarm=bool(self.allarme_sic),
+            safety_reason=self.motivo_allarme or "",
+        )
+        # Distanza pubblicata = EMA stabile (non il grezzo che oscilla)
+        distanza_per_switch = float(dist_decision)
+        self.comando_prec = comando
+        self._last_diag = {
+            "fov_blocked_raw": bool(fov_blocked),
+            "fov_for_decision": bool(fov_for_decision),
+            "invalid_ratio": round(float(invalid_ratio), 3),
+            "full_tex": round(full_tex, 2),
+            "full_std": round(full_std, 2),
+            "dist_raw_cm": round(float(distanza_raw), 1),
+            "has_trustworthy_z": bool(has_trustworthy_z),
+        }
 
         # 7. Rendering delle modalità video (raddrizzate 180° per correggere il montaggio)
         flip_L = cv2.flip(rect_L, -1)
@@ -681,6 +757,8 @@ class StereoDepthEstimator:
             "rect_right": flip_R,
             "composite": composite_view,
             "map_2d": mappa_navigazione,
+            "eye_w": int(self.w_eye),
+            "eye_h": int(self.h_eye),
             "obstacle_found": ostacolo_trovato,
             "obstacle_dist_cm": dist_ostacolo_cm,
             "target_dist_cm": distanza_per_switch,
@@ -698,10 +776,12 @@ class StereoDepthEstimator:
             "driving_command": comando,
             "driving_reason": motivo_cmd,
             "risk_level": risk_level,
-            "fov_blocked": fov_blocked,
+            "fov_blocked": bool(fov_for_decision),
+            "fov_blocked_raw": bool(fov_blocked),
             "safety_alarm": self.allarme_sic,
             "safety_reason": self.motivo_allarme,
             "danger_points": punti_pericolo,
+            "diag": dict(self._last_diag),
             "bands_cm": {
                 "critical": DIST_CRITICAL_CM,
                 "high": DIST_HIGH_CM,

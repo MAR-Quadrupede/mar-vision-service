@@ -54,6 +54,16 @@ class StereoCameraDriver:
         self._mock_step = 0
         self.actual_fps = 0.0
 
+        # Optional override for higher FPS (USB bandwidth). Example: 1280x400 @ 30.
+        import os
+        if os.getenv("MAR_CAM_WIDTH"):
+            try:
+                self.config.frame_width = int(os.getenv("MAR_CAM_WIDTH", self.config.frame_width))
+                self.config.frame_height = int(os.getenv("MAR_CAM_HEIGHT", self.config.frame_height))
+                self.config.fps = int(os.getenv("MAR_CAM_FPS", "30"))
+            except Exception:
+                pass
+
     def _get_backends(self) -> List[int]:
         """Returns ordered list of OpenCV capture backends for the current OS."""
         system = platform.system()

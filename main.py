@@ -35,7 +35,8 @@ except ImportError:
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-STREAM_MAX_W = int(os.getenv("MAR_STREAM_MAX_W", "640"))
+# Keep a wide, clear operator view (full eye FOV). Depth can stay half-res internally.
+STREAM_MAX_W = int(os.getenv("MAR_STREAM_MAX_W", "1280"))
 # YOLO off by default → depth/stream hit camera rate. Set MAR_YOLO_ENABLE=1 to turn on.
 YOLO_ENABLE = os.getenv("MAR_YOLO_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
 YOLO_STRIDE_S = float(os.getenv("MAR_YOLO_PERIOD_S", "1.0"))
@@ -52,6 +53,46 @@ def _prep_stream_frame(frame):
         nh = max(1, int(h * STREAM_MAX_W / w))
         return cv2.resize(frame, (STREAM_MAX_W, nh), interpolation=cv2.INTER_AREA)
     return frame
+
+
+def _draw_obstacle_box(frame_bgr, depth_res):
+    """Obstacle bbox is computed in full-eye space (w_eye×h_eye); scale to preview."""
+    if not depth_res or not depth_res.get("obstacle_found"):
+        return frame_bgr
+    bbox = depth_res.get("obstacle_bbox")
+    if not bbox:
+        return frame_bgr
+    bx1, by1, bx2, by2 = bbox
+    fh, fw = frame_bgr.shape[:2]
+    # Canonical eye size from depth estimator (NOT half-res composite)
+    ref_w = float(depth_res.get("eye_w") or fw)
+    ref_h = float(depth_res.get("eye_h") or fh)
+    if ref_w <= 1 or ref_h <= 1:
+        return frame_bgr
+    sx, sy = fw / ref_w, fh / ref_h
+    x1, y1 = int(bx1 * sx), int(by1 * sy)
+    x2, y2 = int(bx2 * sx), int(by2 * sy)
+    dist = float(depth_res.get("obstacle_dist_cm") or depth_res.get("target_dist_cm") or 0)
+    risk = str(depth_res.get("risk_level") or "").upper()
+    if risk == "CRITICAL" or dist < DIST_CRITICAL_CM:
+        color = (0, 0, 255)
+    elif risk == "HIGH" or dist < DIST_HIGH_CM:
+        color = (0, 140, 255)
+    else:
+        color = (0, 220, 0)
+    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
+    cv2.drawMarker(frame_bgr, ((x1 + x2) // 2, (y1 + y2) // 2), color, cv2.MARKER_CROSS, 18, 2)
+    cv2.putText(
+        frame_bgr,
+        f"OSTACOLO {dist:.0f}cm",
+        (max(8, x1), max(24, y1 - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+    return frame_bgr
 
 
 def _overlay_hud(frame_bgr, dist_cm, cmd, risk, fps_stream, fps_depth):
@@ -295,22 +336,30 @@ def run_vision_service(config: AppConfig):
                 fps_depth = latest.get("fps_depth", 0.0)
                 yolo_ann = latest.get("yolo_ann")
 
-            # Fast preview: left eye (+ optional yolo) + HUD from last depth
-            if yolo_ann is not None:
+            # Wide clear operator view: ALWAYS full left eye FOV (not half-res rect/autofocus crop)
+            if yolo_ann is not None and getattr(yolo_ann, "shape", None) is not None:
                 preview = yolo_ann
                 if preview.ndim == 2:
                     preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+                # If YOLO ran on half-res rect, fall back to raw for FOV
+                if preview.shape[1] < left_raw.shape[1] * 0.75:
+                    preview = left_raw.copy()
             else:
-                preview = left_raw
-                if depth_res is not None and depth_res.get("composite") is not None:
-                    # Prefer lightweight composite when available
-                    preview = depth_res["composite"]
+                preview = left_raw.copy()
+
+            if preview.ndim == 2:
+                preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
+            else:
+                preview = preview.copy()
+
+            if depth_res is not None:
+                preview = _draw_obstacle_box(preview, depth_res)
 
             dist_cm = float(depth_res["target_dist_cm"]) if depth_res else 999.0
             cmd = depth_res["driving_command"] if depth_res else "…"
             risk = depth_res.get("risk_level", classify_distance_cm(dist_cm)) if depth_res else "LOW"
             preview = _overlay_hud(
-                _prep_stream_frame(preview).copy(),
+                _prep_stream_frame(preview),
                 dist_cm,
                 cmd,
                 risk,
@@ -321,9 +370,14 @@ def run_vision_service(config: AppConfig):
             if config.stream.enabled:
                 stream_server.update_frame("composite", preview)
                 stream_server.update_frame("left", preview)
+                # True camera eyes (no HUD) for audit / operator compare
+                stream_server.update_frame("raw_left", _prep_stream_frame(left_raw))
+                stream_server.update_frame("raw_right", _prep_stream_frame(right_raw))
+                stream_server.update_frame("right", _prep_stream_frame(right_raw))
                 if depth_res is not None:
-                    stream_server.update_frame("right", _prep_stream_frame(depth_res.get("rect_right")))
                     stream_server.update_frame("map", depth_res.get("map_2d"))
+                    stream_server.update_frame("depth", _prep_stream_frame(depth_res.get("composite")))
+                diag = (depth_res or {}).get("diag") or {}
                 stream_server.update_status(
                     fps=round(latest.get("fps_stream", 0.0), 1),
                     fps_camera=round(camera.actual_fps, 1),
@@ -344,6 +398,8 @@ def run_vision_service(config: AppConfig):
                     allarme_motivo=depth_res["safety_reason"] if depth_res else "",
                     model=("YOLOV8N" if detector else "OFF"),
                     detections_count=len(latest.get("left_objs") or []),
+                    fov_blocked=bool((depth_res or {}).get("fov_blocked", False)),
+                    diag=diag,
                     bands_cm={
                         "critical": DIST_CRITICAL_CM,
                         "high": DIST_HIGH_CM,

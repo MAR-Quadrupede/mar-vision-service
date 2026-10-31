@@ -81,7 +81,7 @@ class StreamConfig:
     enabled: bool = True
     host: str = "0.0.0.0"
     port: int = 8443
-    jpeg_quality: int = 70
+    jpeg_quality: int = 85
     target_fps: int = 30
 
 

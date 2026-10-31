@@ -38,6 +38,8 @@ class MultiStreamServer:
             "composite": None,
             "map": None
         }
+        # Monotonic generation per key — clients send only when content changes
+        self._frame_gen: Dict[str, int] = {k: 0 for k in self._frames}
         self._status_data: Dict[str, Any] = {
             "status": "ONLINE",
             "fps": 0.0,
@@ -134,7 +136,9 @@ class MultiStreamServer:
                     "/snapshot_map.jpg": "map",
                     "/snapshot_left.jpg": "left",
                     "/snapshot_right.jpg": "right",
-                    "/snapshot_depth.jpg": "depth"
+                    "/snapshot_depth.jpg": "depth",
+                    "/snapshot_raw_left.jpg": "raw_left",
+                    "/snapshot_raw_right.jpg": "raw_right",
                 }
                 if path in snapshot_map:
                     self._serve_snapshot(snapshot_map[path])
@@ -190,15 +194,24 @@ class MultiStreamServer:
                     server_ref._active_stream_clients += 1
 
                 try:
+                    last_gen = -1
                     while server_ref._running:
                         with server_ref._lock:
                             frame_bytes = server_ref._frames.get(key)
+                            gen = server_ref._frame_gen.get(key, 0)
                             if frame_bytes is None and key == "composite":
                                 frame_bytes = server_ref._frames.get("left")
+                                gen = server_ref._frame_gen.get("left", 0)
 
                         if frame_bytes is None:
                             time.sleep(0.02)
                             continue
+
+                        # Skip duplicate re-sends of the same encoded frame
+                        if gen == last_gen:
+                            time.sleep(0.008)
+                            continue
+                        last_gen = gen
 
                         self.wfile.write(b"--frame\r\n")
                         self.wfile.write(b"Content-Type: image/jpeg\r\n")
@@ -206,7 +219,6 @@ class MultiStreamServer:
                         self.wfile.write(frame_bytes)
                         self.wfile.write(b"\r\n")
                         self.wfile.flush()
-                        time.sleep(0.033)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 finally:
@@ -559,6 +571,7 @@ class MultiStreamServer:
 
         with self._lock:
             self._frames[key] = encoded.tobytes()
+            self._frame_gen[key] = int(self._frame_gen.get(key, 0)) + 1
 
     def update_status(self, **kwargs):
         """Updates internal telemetry dictionary."""
