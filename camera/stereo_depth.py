@@ -431,10 +431,11 @@ class StereoDepthEstimator:
         full_tex = float(tex.mean())
         full_std = float(gs_L.std())
         full_mean = float(gs_L.mean())
-        # Blocco FOV preliminare
+        # Blocco FOV preliminare: foglio o mano a contatto stretto con le lenti (<20cm)
+        # Non deve scattare su pareti o corridoi con luce uniforme
         fov_blocked = bool(
-            (invalid_ratio > 0.65 and float(center_tex.mean()) < 8.0 and full_std < 32.0)
-            or (invalid_ratio > 0.88 and full_std < 28.0)
+            (invalid_ratio > 0.85 and float(center_tex.mean()) < 5.0 and full_std < 18.0)
+            or (invalid_ratio > 0.95 and full_std < 14.0)
         )
 
         # 3. Diagnostica sicurezza lenti
@@ -601,7 +602,7 @@ class StereoDepthEstimator:
         distanza_instant = float(dist_ostacolo_cm if ostacolo_trovato else distanza_fronte_cm)
         if fov_for_decision:
             distanza_instant = 20.0
-            self._dist_hist = [20.0]  # Svuota storico per forzare STOP immediato!
+            self._dist_hist.append(20.0)
         elif distanza_instant >= 220.0 and any(d < 150.0 for d in self._dist_hist[-5:]):
             pass
         else:

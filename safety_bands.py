@@ -147,17 +147,17 @@ class RiskDecisionStabilizer:
         )
         # Confirmation windows (seconds). Escalate faster than de-escalate.
         self.escalate_s = float(
-            escalate_s if escalate_s is not None else os.getenv("MAR_RISK_ESCALATE_S", "0.20")
+            escalate_s if escalate_s is not None else os.getenv("MAR_RISK_ESCALATE_S", "0.35")
         )
         self.deescalate_s = float(
-            deescalate_s if deescalate_s is not None else os.getenv("MAR_RISK_DEESCALATE_S", "0.90")
+            deescalate_s if deescalate_s is not None else os.getenv("MAR_RISK_DEESCALATE_S", "2.0")
         )
         self.fov_on_frames = int(
             fov_on_frames if fov_on_frames is not None else os.getenv("MAR_FOV_ON_FRAMES", "5")
         )
-        # Sblocca FOV latch in fretta quando la scena torna valida
+        # Sblocca FOV latch con calma quando la scena torna sicuramente valida
         self.fov_off_frames = int(
-            fov_off_frames if fov_off_frames is not None else os.getenv("MAR_FOV_OFF_FRAMES", "3")
+            fov_off_frames if fov_off_frames is not None else os.getenv("MAR_FOV_OFF_FRAMES", "5")
         )
 
         self.dist_ema: Optional[float] = None
