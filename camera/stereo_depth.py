@@ -23,6 +23,7 @@ try:
         DIST_HIGH_CM,
         DIST_MODERATE_CM,
     )
+    from .motion_tracker import ObjectMotionTracker
 except (ImportError, ValueError):
     from config import DepthConfig
     from safety_bands import (
@@ -31,6 +32,7 @@ except (ImportError, ValueError):
         DIST_HIGH_CM,
         DIST_MODERATE_CM,
     )
+    from camera.motion_tracker import ObjectMotionTracker
 
 
 # Parametri geometrici e soglie rover M.A.R.
@@ -189,6 +191,10 @@ class StereoDepthEstimator:
         self.modalita_vista = 3
         self.auto_switch_attivo = True
         self.offset_autofocus_smooth = float(self.offset_x)
+
+        # Tracker di movimento 3D e visione d'insieme
+        self.motion_tracker = ObjectMotionTracker()
+        self.flip_image = os.getenv("MAR_FLIP_IMAGE", "1").strip().lower() in ("1", "true", "yes")
 
         # Sicurezza e watchdog
         self.gs_prec = None
@@ -425,12 +431,10 @@ class StereoDepthEstimator:
         full_tex = float(tex.mean())
         full_std = float(gs_L.std())
         full_mean = float(gs_L.mean())
-        # Blocco FOV reale (mano/cartone premuto contro la camera)
+        # Blocco FOV preliminare
         fov_blocked = bool(
-            invalid_ratio > 0.95
-            and float(center_tex.mean()) < 1.0
-            and full_std < 4.0
-            and (full_mean > 40.0)
+            (invalid_ratio > 0.65 and float(center_tex.mean()) < 8.0 and full_std < 32.0)
+            or (invalid_ratio > 0.88 and full_std < 28.0)
         )
 
         # 3. Diagnostica sicurezza lenti
@@ -577,31 +581,49 @@ class StereoDepthEstimator:
         else:
             distanza_fronte_cm = 230.0
 
-        # FOV ostruito vero (foglio): solo se NON abbiamo già una distanza stereo affidabile.
-        # Altrimenti un false-positive FOV bloccava CRITICAL a 30cm su stanze normali.
+        # FOV ostruito vero (foglio / mano / ostacolo a contatto ravvicinato <25cm):
+        # A distanza < 25cm SGBM non ha parallasse sufficiente e produce invalid_ratio elevato.
         has_trustworthy_z = bool(
-            ostacolo_trovato and 15.0 < float(dist_ostacolo_cm) < 220.0
-        ) or bool(25.0 < float(distanza_fronte_cm) < 220.0 and len(valide_centrale) > 15)
+            ostacolo_trovato and 25.0 < float(dist_ostacolo_cm) < 220.0
+        ) or bool(28.0 < float(distanza_fronte_cm) < 220.0 and len(valide_centrale) > 18)
+
         fov_for_decision = bool(fov_blocked) and not has_trustworthy_z
         if fov_for_decision:
             ostacolo_trovato = True
+            dist_ostacolo_cm = 20.0
+            distanza_fronte_cm = 20.0
 
         # Filtro passa-basso sull'autofocus
         self.offset_autofocus_smooth = 0.70 * self.offset_autofocus_smooth + 0.30 * offset_target
         offset_autofocus_x = int(round(self.offset_autofocus_smooth))
 
         # Distanza grezza: preferisci blob ostacolo; altrimenti fronte.
-        # Mediana su N frame → niente salti 50↔230 che tengono HIGH bloccato.
         distanza_instant = float(dist_ostacolo_cm if ostacolo_trovato else distanza_fronte_cm)
-        # Non avvelenare lo storico con il sentinel "vuoto" (230) se poco prima c'era un ostacolo
-        if distanza_instant >= 220.0 and any(d < 150.0 for d in self._dist_hist[-5:]):
+        if fov_for_decision:
+            distanza_instant = 20.0
+            self._dist_hist = [20.0]  # Svuota storico per forzare STOP immediato!
+        elif distanza_instant >= 220.0 and any(d < 150.0 for d in self._dist_hist[-5:]):
             pass
         else:
             self._dist_hist.append(distanza_instant)
             if len(self._dist_hist) > self._dist_hist_max:
                 self._dist_hist = self._dist_hist[-self._dist_hist_max:]
+
         distanza_raw = float(np.median(np.asarray(self._dist_hist, dtype=np.float64))) if self._dist_hist else distanza_instant
         distanza_per_switch = float(distanza_raw)
+
+        # Tracciamento dinamica 3D (avvicinamento, allontanamento, movimento, TTC, visione d'insieme)
+        target_z_calc = float(20.0 if fov_for_decision else (dist_ostacolo_cm if ostacolo_trovato else distanza_fronte_cm))
+        blob_cx = float(np.mean(roi_robot[:, :, 0][blob])) if (ostacolo_trovato and blob is not None and np.any(blob)) else 0.0
+        blob_cy = float(np.mean(roi_robot[:, :, 1][blob])) if (ostacolo_trovato and blob is not None and np.any(blob)) else 0.0
+        motion_telemetry = self.motion_tracker.update(
+            target_z_cm=target_z_calc,
+            target_x_cm=blob_cx,
+            target_y_cm=blob_cy,
+            spatial_grid=spatial_grid_3d,
+            now=self.t_ultimo_frame
+        )
+
         if self.auto_switch_attivo:
             if distanza_per_switch < SOGLIA_DISTANZA_CM:
                 self.modalita_vista = 3
@@ -744,6 +766,35 @@ class StereoDepthEstimator:
             2
         )
 
+        # OSD Dinamica 3D e Visione d'Insieme (avvicinamento, allontanamento, TTC, varchi)
+        m_state = motion_telemetry.get("motion_state", "STABILE")
+        vz = motion_telemetry.get("velocity_z_cms", 0.0)
+        ttc = motion_telemetry.get("ttc_sec", 999.0)
+        ttc_str = f" | TTC: {ttc:.1f}s" if ttc < 900 else ""
+        colore_motion = (0, 0, 255) if vz < -25.0 else ((0, 165, 255) if vz < -10.0 else (0, 255, 120))
+        cv2.putText(
+            composite_view,
+            f"Dinamica: {m_state} (Vz: {vz:+.0f} cm/s){ttc_str}",
+            (15, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            colore_motion,
+            2
+        )
+
+        suggerito = motion_telemetry.get("evasion_recommendation", "AVANTI")
+        cl_sx = motion_telemetry.get("clearance_sx_cm", 999.0)
+        cl_dx = motion_telemetry.get("clearance_dx_cm", 999.0)
+        cv2.putText(
+            composite_view,
+            f"Spazio: SX:{cl_sx:.0f}cm DX:{cl_dx:.0f}cm -> Rotta: {suggerito}",
+            (15, 95),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (255, 255, 255),
+            1
+        )
+
         if self.allarme_sic:
             vh, vw = composite_view.shape[:2]
             cv2.rectangle(composite_view, (0, 0), (vw - 1, vh - 1), (0, 0, 255), 6)
@@ -751,6 +802,10 @@ class StereoDepthEstimator:
             cv2.rectangle(composite_view, (0, vh // 2 - 25), (vw - 1, vh // 2 + 25), (0, 0, 160), -1)
             cv2.putText(composite_view, txt_stop, (max(20, (vw - len(txt_stop) * 14) // 2), vh // 2 + 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # Capovolgi l'immagine se richiesto (rotazione 180° per correggere il montaggio)
+        if self.flip_image:
+            composite_view = cv2.flip(composite_view, -1)
 
         return {
             "rect_left": flip_L,
@@ -778,6 +833,7 @@ class StereoDepthEstimator:
             "risk_level": risk_level,
             "fov_blocked": bool(fov_for_decision),
             "fov_blocked_raw": bool(fov_blocked),
+            "motion": motion_telemetry,
             "safety_alarm": self.allarme_sic,
             "safety_reason": self.motivo_allarme,
             "danger_points": punti_pericolo,

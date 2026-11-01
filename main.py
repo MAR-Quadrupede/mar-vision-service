@@ -230,14 +230,18 @@ def run_vision_service(config: AppConfig):
                     "safety_alarm": depth_res["safety_alarm"],
                     "safety_reason": depth_res["safety_reason"],
                     "bands_cm": depth_res.get("bands_cm", {}),
+                    "motion": depth_res.get("motion", {}),
                 }
                 mqtt_client.publish("mar/vision/command", json.dumps(payload))
+                if depth_res.get("motion"):
+                    mqtt_client.publish("mar/vision/motion", json.dumps(depth_res["motion"]))
                 mqtt_client.publish(
                     "mar/vision/detections",
                     json.dumps(
                         {
                             "timestamp": now,
                             "spatial_grid_3d": depth_res.get("spatial_grid_3d", {}),
+                            "motion": depth_res.get("motion", {}),
                             "z_basso_cm": payload["z_basso_cm"],
                             "z_centro_cm": payload["z_centro_cm"],
                             "z_alto_cm": round(float(depth_res.get("z_alto_cm", 999.0)), 1),
@@ -399,6 +403,7 @@ def run_vision_service(config: AppConfig):
                     model=("YOLOV8N" if detector else "OFF"),
                     detections_count=len(latest.get("left_objs") or []),
                     fov_blocked=bool((depth_res or {}).get("fov_blocked", False)),
+                    motion=(depth_res or {}).get("motion") or {},
                     diag=diag,
                     bands_cm={
                         "critical": DIST_CRITICAL_CM,
