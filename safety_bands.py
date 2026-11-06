@@ -28,9 +28,9 @@ import time
 from typing import Optional, Tuple
 
 # Centimetri — taratura fisica robot (ispirata al codice definitivo canelidarstereoimudef2)
-DIST_CRITICAL_CM = 30.0   # < 30 cm: arresto immediato di collisione
-DIST_HIGH_CM = 65.0       # 30-65 cm: deviazione / schivamento dinamico
-DIST_MODERATE_CM = 120.0  # 65-120 cm: allerta di prossimità
+DIST_CRITICAL_CM = 40.0   # < 40 cm: arresto immediato di collisione
+DIST_HIGH_CM = 70.0       # 40-70 cm: deviazione / schivamento dinamico
+DIST_MODERATE_CM = 120.0  # 70-120 cm: allerta di prossimità
 
 # Metri (dashboard / MQTT consumers)
 DIST_CRITICAL_M = DIST_CRITICAL_CM / 100.0
@@ -42,9 +42,9 @@ RISK_LEVELS = ("LOW", "MODERATE", "HIGH", "CRITICAL")
 _RISK_IDX = {name: i for i, name in enumerate(RISK_LEVELS)}
 
 # Isteresi in uscita: bisogna essere più lontani per scendere di livello
-EXIT_CRITICAL_CM = DIST_CRITICAL_CM + 10.0   # 40 — leave CRITICAL
-EXIT_HIGH_CM = DIST_HIGH_CM + 10.0           # 75 — leave HIGH
-EXIT_MODERATE_CM = DIST_MODERATE_CM + 15.0   # 135 — leave MODERATE
+EXIT_CRITICAL_CM = DIST_CRITICAL_CM + 12.0   # 52 — leave CRITICAL
+EXIT_HIGH_CM = DIST_HIGH_CM + 15.0           # 85 — leave HIGH
+EXIT_MODERATE_CM = DIST_MODERATE_CM + 20.0   # 140 — leave MODERATE
 
 
 def classify_distance_cm(dist_cm: float) -> str:
