@@ -194,6 +194,7 @@ def run_vision_service(config: AppConfig):
                 depth_res = depth_estimator.process_stereo_frame(left_raw, right_raw)
             except Exception as e:
                 print(f"[DEPTH] errore: {e}")
+                time.sleep(0.05)
                 continue
 
             fcount += 1

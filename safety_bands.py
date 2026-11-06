@@ -150,7 +150,7 @@ class RiskDecisionStabilizer:
             escalate_s if escalate_s is not None else os.getenv("MAR_RISK_ESCALATE_S", "0.35")
         )
         self.deescalate_s = float(
-            deescalate_s if deescalate_s is not None else os.getenv("MAR_RISK_DEESCALATE_S", "2.0")
+            deescalate_s if deescalate_s is not None else os.getenv("MAR_RISK_DEESCALATE_S", "0.6")
         )
         self.fov_on_frames = int(
             fov_on_frames if fov_on_frames is not None else os.getenv("MAR_FOV_ON_FRAMES", "5")
@@ -215,7 +215,7 @@ class RiskDecisionStabilizer:
             self.dist_ema = raw_dist
         else:
             a_near = min(0.75, self.ema_alpha + 0.25)  # più reattivo verso il vicino
-            a_far = max(0.12, self.ema_alpha - 0.15)   # più lento verso il lontano
+            a_far = 0.50 if raw_dist >= 150.0 else max(0.20, self.ema_alpha - 0.10)
             a = a_near if raw_dist < self.dist_ema else a_far
             self.dist_ema = (1.0 - a) * self.dist_ema + a * raw_dist
 
@@ -255,12 +255,16 @@ class RiskDecisionStabilizer:
                 self.level_since = now
                 self.pending_level = None
         elif cand_i < held_i:
-            # De-escalation: target più safe; se cambia, resetta dwell
+            # De-escalation: se via libera (>150cm), de-escalation rapida
+            dwell_needed = 0.35 if effective >= 150.0 else self.deescalate_s
             if self.pending_level != candidate:
                 self.pending_level = candidate
                 self.pending_since = now
-            elif (now - self.pending_since) >= self.deescalate_s:
-                self.held_level = RISK_LEVELS[held_i - 1]  # un gradino alla volta
+            elif (now - self.pending_since) >= dwell_needed:
+                if effective >= 150.0:
+                    self.held_level = "LOW"
+                else:
+                    self.held_level = RISK_LEVELS[held_i - 1]  # un gradino alla volta
                 self.level_since = now
                 self.pending_level = None
 

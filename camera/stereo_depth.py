@@ -536,6 +536,7 @@ class StereoDepthEstimator:
         ostacolo_trovato = False
         dist_ostacolo_cm = 999.0
         bbox_ostacolo = None
+        blob = None
         offset_target = float(self.offset_x)
 
         if np.sum(mask_corridoio) > 15:
@@ -566,21 +567,29 @@ class StereoDepthEstimator:
                     # Autofocus stereoscopico esatto: sposta R di -disp_mediana_obs
                     offset_target = float(np.clip(-disp_mediana_obs, -120.0, 40.0))
 
-        # Stima parete frontale (frame robot, ROI centrale)
+        # Stima parete frontale (frame robot, ROI centrale, filtrata dall'altezza del robot per evitare il pavimento)
         c_roi_inizio = int(W_vel * 0.30)
         c_roi_fine = int(W_vel * 0.70)
-        roi_centrale_z = punti_robot_cm[r_utile_min:r_utile_max, c_roi_inizio:c_roi_fine, 2]
-        valide_centrale = roi_centrale_z[
-            (roi_centrale_z > 30.0) & (roi_centrale_z < MAX_DIST_CM) & np.isfinite(roi_centrale_z)
-        ]
+        roi_centrale_pts = punti_robot_cm[r_utile_min:r_utile_max, c_roi_inizio:c_roi_fine, :]
+        roi_centrale_y = roi_centrale_pts[:, :, 1]
+        roi_centrale_z = roi_centrale_pts[:, :, 2]
+        maschera_valide = (
+            (roi_centrale_z > 30.0) &
+            (roi_centrale_z < MAX_DIST_CM) &
+            (roi_centrale_y > ALTEZZA_MIN_ROBOT) &
+            (roi_centrale_y < ALTEZZA_MAX_ROBOT) &
+            np.isfinite(roi_centrale_z)
+        )
+        valide_centrale = roi_centrale_z[maschera_valide]
 
-        if len(valide_centrale) > 20:
-            # 25° percentile: reattivo agli ostacoli, meno rumore del min assoluto
-            distanza_fronte_cm = float(np.percentile(valide_centrale, 25))
-        elif ostacolo_trovato:
+        if ostacolo_trovato:
             distanza_fronte_cm = dist_ostacolo_cm
+        elif len(valide_centrale) > 15:
+            # Mediana della profondità frontale nel corridoio robot (robusta al rumore)
+            distanza_fronte_cm = float(np.median(valide_centrale))
         else:
-            distanza_fronte_cm = 230.0
+            # Spazio aperto oltre portata stereocamera
+            distanza_fronte_cm = 300.0
 
         # FOV ostruito vero (foglio / mano / ostacolo a contatto ravvicinato <25cm):
         # A distanza < 25cm SGBM non ha parallasse sufficiente e produce invalid_ratio elevato.
@@ -602,10 +611,12 @@ class StereoDepthEstimator:
         distanza_instant = float(dist_ostacolo_cm if ostacolo_trovato else distanza_fronte_cm)
         if fov_for_decision:
             distanza_instant = 20.0
-            self._dist_hist.append(20.0)
-        elif distanza_instant >= 220.0 and any(d < 150.0 for d in self._dist_hist[-5:]):
-            pass
+            self._dist_hist = [20.0]
         else:
+            # Se la via è libera (nessun ostacolo e distanza frontale ampia > 150cm),
+            # ripulisci rapidamente letture basse stantie per evitare deadlock di isteresi
+            if not ostacolo_trovato and distanza_instant >= 150.0:
+                self._dist_hist = [d for d in self._dist_hist if d >= 120.0]
             self._dist_hist.append(distanza_instant)
             if len(self._dist_hist) > self._dist_hist_max:
                 self._dist_hist = self._dist_hist[-self._dist_hist_max:]

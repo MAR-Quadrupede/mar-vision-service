@@ -62,6 +62,13 @@ class ObjectMotionTracker:
 
         # Aggiungi campione valido
         if 10.0 <= target_z_cm <= 450.0:
+            # Outlier / discontinuity check: se la distanza salta istantaneamente > 45cm tra due frame consecutivi,
+            # è un cambio di target o rumore stereo, non un movimento fisico continuo continuo!
+            if self.history:
+                prev_z = self.history[-1][3]
+                if abs(target_z_cm - prev_z) > 45.0:
+                    self.history.clear()
+                    self.vz_ema = 0.0
             self.history.append((t, float(target_x_cm), float(target_y_cm), float(target_z_cm)))
             if len(self.history) > self.history_len:
                 self.history = self.history[-self.history_len:]
@@ -76,8 +83,11 @@ class ObjectMotionTracker:
 
             if dt >= 0.08:
                 # vz < 0 significa che z sta diminuendo (l'oggetto si sta AVVICINANDO)
-                vz_inst = (z_cur - z_old) / dt
-                vx_inst = (x_cur - x_old) / dt
+                # Clamp a velocità fisiche realistiche per quadrupede indoor (max 100 cm/s = 1.0 m/s)
+                raw_vz = (z_cur - z_old) / dt
+                raw_vx = (x_cur - x_old) / dt
+                vz_inst = max(-100.0, min(100.0, raw_vz))
+                vx_inst = max(-100.0, min(100.0, raw_vx))
 
                 self.vz_ema = (self.ema_alpha * vz_inst) + ((1.0 - self.ema_alpha) * self.vz_ema)
                 self.vx_ema = (self.ema_alpha * vx_inst) + ((1.0 - self.ema_alpha) * self.vx_ema)

@@ -93,6 +93,12 @@ class MultiStreamServer:
                 self.end_headers()
 
             def do_GET(self):
+                try:
+                    self._handle_get()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def _handle_get(self):
                 parsed = urlparse(self.path)
                 path = parsed.path
 
