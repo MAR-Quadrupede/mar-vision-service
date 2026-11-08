@@ -20,7 +20,7 @@ from config import parse_cli_arguments, AppConfig
 from camera.stereo_camera import StereoCameraDriver
 from camera.stereo_depth import StereoDepthEstimator
 from detector.yolo_detector import YOLODetector
-from detector.object_localizer import localize_objects
+from detector.object_localizer import DetectionStabilizer, localize_objects
 from server.mjpeg_server import MultiStreamServer
 from safety_bands import (
     DIST_CRITICAL_CM,
@@ -341,6 +341,7 @@ def run_vision_service(config: AppConfig):
         if detector is None:
             return
         t_last = time.time()
+        stabilizer = DetectionStabilizer(needed=2)
         while not stop_evt.is_set():
             frame = None
             depth_snapshot = None
@@ -354,7 +355,7 @@ def run_vision_service(config: AppConfig):
                 t0 = time.time()
                 ann, objs = detector.detect_single(frame, "LEFT", imgsz=YOLO_IMGSZ)
                 # Geometria 3D per oggetto: distanza (percentile Z), bearing, settore LiDAR-compatibile
-                objs_payload = localize_objects(objs, depth_snapshot, frame.shape[:2])
+                objs_payload = stabilizer.update(localize_objects(objs, depth_snapshot, frame.shape[:2]))
                 dt = time.time() - t0
                 with state_lock:
                     latest["left_objs"] = objs

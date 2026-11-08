@@ -53,6 +53,10 @@ class StereoCameraDriver:
         self._latest_frame: Optional[StereoFrame] = None
         self._mock_step = 0
         self.actual_fps = 0.0
+        self._reopen_lock = threading.Lock()
+        self._last_frame_mono = 0.0
+        self.stalled = False
+        self._watchdog: Optional[threading.Thread] = None
 
         # Optional override for higher FPS (USB bandwidth). Example: 1280x400 @ 30.
         import os
@@ -79,40 +83,11 @@ class StereoCameraDriver:
         Attempts to open the camera using primary index and fallback candidates.
         Falls back to synthetic mock stream if no physical camera is accessible.
         """
-        backends = self._get_backends()
-        indices = [self.config.primary_index]
-        indices.extend([idx for idx in self.config.fallback_indices if idx != self.config.primary_index])
-
         print("\n[CAMERA] Inizializzazione 3D Global Shutter Stereo Camera...")
 
-        for attempt in range(1, 4):
-            for index in indices:
-                for backend in backends:
-                    try:
-                        cap = cv2.VideoCapture(index, backend)
-                        if cap.isOpened():
-                            try:
-                                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                            except Exception:
-                                pass
-                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
-                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
-                            cap.set(cv2.CAP_PROP_FPS, self.config.fps)
-
-                            ret, test_frame = cap.read()
-                            if ret and test_frame is not None and test_frame.size > 0:
-                                self.cap = cap
-                                self.active_index = index
-                                self.is_opened = True
-                                self._apply_hardware_settings()
-                                self._start_capture_thread()
-                                return True
-                        cap.release()
-                    except Exception:
-                        pass
-            if attempt < 3:
-                time.sleep(0.5)
+        if self._open_device():
+            self._start_capture_thread()
+            return True
 
         print("  ⚠️ Nessuna telecamera fisica disponibile sui dispositivi testati.")
         print("  🔧 Attivazione modalità MOCK SINTETICA per test ed emulazione continua...")
@@ -120,6 +95,82 @@ class StereoCameraDriver:
         self.is_opened = True
         self._start_capture_thread()
         return True
+
+    def _configure_capture(self, cap: "cv2.VideoCapture") -> None:
+        """MJPG, buffer 1, timeout di lettura: senza timeout V4L2 blocca read() per sempre se l'USB cade."""
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        for prop_name in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
+            prop = getattr(cv2, prop_name, None)
+            if prop is not None:
+                try:
+                    cap.set(prop, 2000)
+                except Exception:
+                    pass
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
+        cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+
+    def _open_device(self) -> bool:
+        """Apre una telecamera fisica. Non avvia thread e non cade nel mock."""
+        backends = self._get_backends()
+        indices = [self.config.primary_index]
+        indices.extend([idx for idx in self.config.fallback_indices if idx != self.config.primary_index])
+        for attempt in range(1, 4):
+            for index in indices:
+                for backend in backends:
+                    cap = None
+                    try:
+                        cap = cv2.VideoCapture(index, backend)
+                        if not cap.isOpened():
+                            cap.release()
+                            continue
+                        self._configure_capture(cap)
+                        ret, test_frame = cap.read()
+                        if ret and test_frame is not None and test_frame.size > 0:
+                            self.cap = cap
+                            self.active_index = index
+                            self.is_opened = True
+                            self.is_mock = False
+                            self.stalled = False
+                            self._last_frame_mono = time.perf_counter()
+                            self._apply_hardware_settings()
+                            return True
+                        cap.release()
+                    except Exception:
+                        if cap is not None:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+            if attempt < 3:
+                time.sleep(0.4)
+        return False
+
+    def _drop_capture(self) -> None:
+        cap = self.cap
+        self.cap = None
+        self.is_opened = False
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+    def _reopen_device(self) -> bool:
+        """Rilascia il device (sblocca un read() appeso) e riprova le /dev/video. Mai il mock."""
+        with self._reopen_lock:
+            self.stalled = True
+            self._drop_capture()
+            ok = self._open_device()
+            if ok:
+                print(f"[CAMERA] riagganciata su /dev/video{self.active_index}")
+            else:
+                print("[CAMERA] device assente, riprovo")
+            return ok
 
     def _apply_hardware_settings(self):
         """Applies resolution, frame rate and disables auto-tuning for Global Shutter."""
@@ -162,10 +213,13 @@ class StereoCameraDriver:
         print(f"  • Montaggio invertito 180°: {'ATTIVO' if self.upside_down else 'DISATTIVO'}")
 
     def _start_capture_thread(self):
-        """Starts asynchronous acquisition thread."""
+        """Starts asynchronous acquisition thread and the USB stall watchdog."""
         self._running = True
+        self._last_frame_mono = time.perf_counter()
         self._thread = threading.Thread(target=self._capture_worker, name="CameraCaptureThread", daemon=True)
         self._thread.start()
+        self._watchdog = threading.Thread(target=self._watchdog_worker, name="CameraWatchdog", daemon=True)
+        self._watchdog.start()
 
     def _generate_mock_frame(self) -> StereoFrame:
         """Generates synthetic stereo frame with animated simulated obstacles."""
@@ -208,6 +262,7 @@ class StereoCameraDriver:
         """Background loop acquiring fresh frames with minimal latency."""
         n_frames = 0
         t_fps = time.perf_counter()
+        fail_streak = 0
 
         while self._running:
             if self.is_mock:
@@ -217,14 +272,28 @@ class StereoCameraDriver:
                     self._cond.notify_all()
                 continue
 
-            if not self.cap or not self.cap.isOpened():
-                time.sleep(0.1)
+            cap = self.cap
+            if cap is None or not cap.isOpened():
+                self._reopen_device()
+                time.sleep(0.5)
                 continue
 
-            ret, combined = self.cap.read()
-            if not ret or combined is None or combined.size == 0:
-                time.sleep(0.01)
+            try:
+                ret, combined = cap.read()
+            except Exception:
+                ret, combined = False, None
+            if not ret or combined is None or getattr(combined, "size", 0) == 0:
+                fail_streak += 1
+                self.stalled = True
+                # read() è tornato (timeout o device staccato): riapri, non restare sul vecchio frame
+                if fail_streak >= 8:
+                    print(f"[CAMERA] {fail_streak} letture vuote, riapro il dispositivo")
+                    self._reopen_device()
+                    fail_streak = 0
+                time.sleep(0.05)
                 continue
+            fail_streak = 0
+            self.stalled = False
 
             if self.upside_down:
                 # 180° rotation flips horizontal and vertical
@@ -246,6 +315,7 @@ class StereoCameraDriver:
 
             n_frames += 1
             now = time.perf_counter()
+            self._last_frame_mono = now
             if now - t_fps >= 1.0:
                 self.actual_fps = n_frames / (now - t_fps)
                 n_frames = 0
@@ -254,6 +324,23 @@ class StereoCameraDriver:
             with self._lock:
                 self._latest_frame = frame
                 self._cond.notify_all()
+
+    def _watchdog_worker(self):
+        """Se read() resta bloccato dentro V4L2 (USB staccata), release() dall'altro thread lo sblocca."""
+        while self._running:
+            time.sleep(0.5)
+            if self.is_mock or not self._running:
+                continue
+            last = self._last_frame_mono
+            if last <= 0.0:
+                continue
+            stalled_for = time.perf_counter() - last
+            if stalled_for < 3.0:
+                continue
+            self.stalled = True
+            print(f"[CAMERA] nessun frame da {stalled_for:.1f}s (USB?), riaggancio")
+            self._reopen_device()
+            time.sleep(1.0)
 
     def read(self, timeout: float = 0.5) -> Optional[StereoFrame]:
         """

@@ -125,3 +125,31 @@ def localize_objects(objects: List[Any], depth_res: Optional[Dict[str, Any]], fr
             "relative_size": round(float(getattr(o, "relative_size", 0.0)), 4),
         })
     return out
+
+
+class DetectionStabilizer:
+    """Pubblica un oggetto solo se la stessa classe resta nello stesso settore per `needed` inferenze.
+
+    yolov8n a 256 px sulla stereocamera alterna classi (persona/letto/ombrello) sullo stesso
+    fotogramma: una detection isolata non deve entrare in Q_s.
+    """
+
+    def __init__(self, needed: int = 2):
+        self.needed = max(1, int(needed))
+        self._streak: Dict[Tuple[str, str], int] = {}
+
+    def update(self, objs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen: Dict[Tuple[str, str], int] = {}
+        for o in objs:
+            key = (str(o.get("class") or ""), str(o.get("sector") or ""))
+            seen[key] = self._streak.get(key, 0) + 1
+        self._streak = seen
+        confirmed: List[Dict[str, Any]] = []
+        emitted = set()
+        for o in objs:
+            key = (str(o.get("class") or ""), str(o.get("sector") or ""))
+            if key in emitted or seen[key] < self.needed:
+                continue
+            emitted.add(key)
+            confirmed.append(o)
+        return confirmed
