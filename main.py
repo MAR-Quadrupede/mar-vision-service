@@ -5,7 +5,7 @@ M.A.R. — mar-vision-service Microservice Daemon
 Realtime architecture (target ≥30 FPS display):
   • Capture + MJPEG overlay loop never waits on YOLO
   • Depth worker (StereoBM) runs in parallel; latest result wins
-  • YOLO optional background thread (off by default for max FPS)
+  • YOLO background thread (on by default, ~2 Hz) with per-object stereo distance/bearing
 """
 
 import sys
@@ -20,6 +20,7 @@ from config import parse_cli_arguments, AppConfig
 from camera.stereo_camera import StereoCameraDriver
 from camera.stereo_depth import StereoDepthEstimator
 from detector.yolo_detector import YOLODetector
+from detector.object_localizer import localize_objects
 from server.mjpeg_server import MultiStreamServer
 from safety_bands import (
     DIST_CRITICAL_CM,
@@ -37,9 +38,12 @@ MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 # Keep a wide, clear operator view (full eye FOV). Depth can stay half-res internally.
 STREAM_MAX_W = int(os.getenv("MAR_STREAM_MAX_W", "1280"))
-# YOLO off by default → depth/stream hit camera rate. Set MAR_YOLO_ENABLE=1 to turn on.
-YOLO_ENABLE = os.getenv("MAR_YOLO_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
-YOLO_STRIDE_S = float(os.getenv("MAR_YOLO_PERIOD_S", "1.0"))
+# YOLO ON di default (thread separato, non blocca depth/stream). MAR_YOLO_ENABLE=0 per disattivarlo.
+YOLO_ENABLE = os.getenv("MAR_YOLO_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+YOLO_STRIDE_S = float(os.getenv("MAR_YOLO_PERIOD_S", "0.5"))
+YOLO_IMGSZ = int(os.getenv("MAR_YOLO_IMGSZ", "256"))
+# Gli oggetti YOLO restano validi per il decision engine per questo tempo dopo l'ultima inferenza
+YOLO_OBJ_TTL_S = float(os.getenv("MAR_YOLO_OBJ_TTL_S", "1.5"))
 TARGET_STREAM_FPS = float(os.getenv("MAR_TARGET_STREAM_FPS", "30"))
 
 
@@ -118,6 +122,44 @@ def _overlay_hud(frame_bgr, dist_cm, cmd, risk, fps_stream, fps_depth):
     return out
 
 
+def _draw_yolo_objects(out, objs_payload, src_shape):
+    """Disegna gli oggetti YOLO (box in coordinate rect_left) sul frame operatore, riscalando le box."""
+    if not objs_payload or src_shape is None:
+        return out
+    sh, sw = int(src_shape[0]), int(src_shape[1])
+    if sh <= 0 or sw <= 0:
+        return out
+    H, W = out.shape[:2]
+    fx, fy = W / float(sw), H / float(sh)
+    for o in objs_payload:
+        try:
+            x1, y1, x2, y2 = o["bbox"]
+        except Exception:
+            continue
+        x1, x2 = int(x1 * fx), int(x2 * fx)
+        y1, y2 = int(y1 * fy), int(y2 * fy)
+        d = o.get("dist_cm")
+        color = (0, 200, 255)
+        if d is not None:
+            if d < DIST_CRITICAL_CM:
+                color = (0, 0, 255)
+            elif d < DIST_HIGH_CM:
+                color = (0, 120, 255)
+            elif d < DIST_MODERATE_CM:
+                color = (0, 220, 255)
+            else:
+                color = (80, 220, 80)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        label = f"{o.get('class','?')} {o.get('confidence',0):.2f}"
+        label += f" | {d:.0f}cm" if d is not None else " | ?cm"
+        label += f" {o.get('bearing_deg',0):+.0f}deg"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        yb = max(y1, th + 8)
+        cv2.rectangle(out, (x1, yb - th - 6), (x1 + tw + 6, yb + 2), color, -1)
+        cv2.putText(out, label, (x1 + 3, yb - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    return out
+
+
 def run_vision_service(config: AppConfig):
     print("=" * 72)
     print("  🐾 M.A.R. — 3D STEREO VISION & AUTONOMOUS DRIVING SERVICE")
@@ -154,7 +196,16 @@ def run_vision_service(config: AppConfig):
 
     detector = None
     if YOLO_ENABLE:
-        detector = YOLODetector(config.detector)
+        model_override = os.getenv("MAR_YOLO_MODEL", "").strip()
+        if model_override:
+            config.detector.model_name_or_path = model_override
+        try:
+            detector = YOLODetector(config.detector)
+            print(f"  ✓ YOLO attivo: {detector.model_name} | imgsz={YOLO_IMGSZ} | periodo={YOLO_STRIDE_S:.2f}s")
+        except Exception as e:
+            # La visione stereo/safety NON deve morire se il modello manca: prosegui senza oggetti
+            print(f"  ⚠️ YOLO non disponibile ({e}): proseguo con sola stereo-depth")
+            detector = None
     else:
         print("  ℹ️ YOLO disabilitato (MAR_YOLO_ENABLE=0) per FPS massimi")
 
@@ -172,6 +223,9 @@ def run_vision_service(config: AppConfig):
         "fps_depth": 0.0,
         "fps_stream": 0.0,
         "frame_for_yolo": None,
+        "left_objs_payload": [],   # oggetti arricchiti (dist_cm, bearing_deg, sector) pronti per MQTT
+        "left_objs_ts": 0.0,
+        "yolo_fps": 0.0,
     }
     stop_evt = threading.Event()
     depth_queue: list = []
@@ -214,6 +268,11 @@ def run_vision_service(config: AppConfig):
 
             # MQTT as soon as depth is ready (decision latency)
             if mqtt_client and mqtt_client.is_connected():
+                with state_lock:
+                    objs_payload = (
+                        list(latest["left_objs_payload"])
+                        if (now - latest["left_objs_ts"]) <= YOLO_OBJ_TTL_S else []
+                    )
                 dist = float(depth_res["target_dist_cm"])
                 payload = {
                     "timestamp": now,
@@ -249,15 +308,10 @@ def run_vision_service(config: AppConfig):
                             "ground_hazard": payload["ground_hazard"],
                             "target_dist_cm": payload["target_dist_cm"],
                             "risk_level": payload["risk_level"],
-                            "objects_count": len(latest["left_objs"]),
-                            "objects": [
-                                {
-                                    "class": o.label,
-                                    "confidence": round(float(o.confidence), 2),
-                                    "bbox": [int(x) for x in o.bbox],
-                                }
-                                for o in latest["left_objs"]
-                            ],
+                            "objects_count": len(objs_payload),
+                            "objects": objs_payload,
+                            "objects_age_s": round(now - latest["left_objs_ts"], 2) if latest["left_objs_ts"] else None,
+                            "yolo_enabled": detector is not None,
                         }
                     ),
                 )
@@ -275,15 +329,9 @@ def run_vision_service(config: AppConfig):
                             "fps_depth": round(latest["fps_depth"], 1),
                             "fps_stream": round(latest["fps_stream"], 1),
                             "risk_level": payload["risk_level"],
-                            "objects_count": len(latest["left_objs"]),
-                            "objects": [
-                                {
-                                    "class": o.label,
-                                    "confidence": round(float(o.confidence), 2),
-                                    "bbox": [int(x) for x in o.bbox],
-                                }
-                                for o in latest["left_objs"]
-                            ],
+                            "fps_yolo": round(latest["yolo_fps"], 2),
+                            "objects_count": len(objs_payload),
+                            "objects": objs_payload,
                         }
                     ),
                 )
@@ -291,18 +339,35 @@ def run_vision_service(config: AppConfig):
     def yolo_worker():
         if detector is None:
             return
+        t_last = time.time()
         while not stop_evt.is_set():
             frame = None
+            depth_snapshot = None
             with state_lock:
                 frame = latest.get("frame_for_yolo")
+                depth_snapshot = latest.get("depth_res")  # stessa coppia stereo del frame
             if frame is None:
                 time.sleep(0.05)
                 continue
             try:
-                ann, objs = detector.detect_single(frame, "LEFT", imgsz=160)
+                t0 = time.time()
+                ann, objs = detector.detect_single(frame, "LEFT", imgsz=YOLO_IMGSZ)
+                # Geometria 3D per oggetto: distanza (percentile Z), bearing, settore LiDAR-compatibile
+                objs_payload = localize_objects(objs, depth_snapshot, frame.shape[:2])
+                dt = time.time() - t0
                 with state_lock:
                     latest["left_objs"] = objs
+                    latest["left_objs_payload"] = objs_payload
+                    latest["left_objs_ts"] = time.time()
                     latest["yolo_ann"] = ann
+                    latest["yolo_fps"] = 1.0 / max(1e-3, time.time() - t_last)
+                t_last = time.time()
+                if objs_payload and (int(t_last) % 5 == 0):
+                    desc = ", ".join(
+                        f"{o['class']}@{o['dist_cm'] if o['dist_cm'] is not None else '?'}cm/{o['bearing_deg']:+.0f}°"
+                        for o in objs_payload[:4]
+                    )
+                    print(f"[YOLO] {len(objs_payload)} ogg. ({dt*1000:.0f}ms): {desc}")
             except Exception as e:
                 print(f"[YOLO] {e}")
             stop_evt.wait(YOLO_STRIDE_S)
@@ -340,25 +405,22 @@ def run_vision_service(config: AppConfig):
                 depth_res = latest.get("depth_res")
                 fps_depth = latest.get("fps_depth", 0.0)
                 yolo_ann = latest.get("yolo_ann")
+                objs_now = (
+                    list(latest["left_objs_payload"])
+                    if (time.time() - latest["left_objs_ts"]) <= YOLO_OBJ_TTL_S else []
+                )
 
             # Wide clear operator view: ALWAYS full left eye FOV (not half-res rect/autofocus crop)
-            if yolo_ann is not None and getattr(yolo_ann, "shape", None) is not None:
-                preview = yolo_ann
-                if preview.ndim == 2:
-                    preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
-                # If YOLO ran on half-res rect, fall back to raw for FOV
-                if preview.shape[1] < left_raw.shape[1] * 0.75:
-                    preview = left_raw.copy()
-            else:
-                preview = left_raw.copy()
-
+            preview = left_raw.copy()
             if preview.ndim == 2:
                 preview = cv2.cvtColor(preview, cv2.COLOR_GRAY2BGR)
-            else:
-                preview = preview.copy()
 
             if depth_res is not None:
                 preview = _draw_obstacle_box(preview, depth_res)
+            if objs_now:
+                # box YOLO (coordinate rect_left) riscalate sul frame pieno, con distanza stereo e bearing
+                src_shape = yolo_ann.shape[:2] if getattr(yolo_ann, "shape", None) is not None else None
+                preview = _draw_yolo_objects(preview, objs_now, src_shape)
 
             dist_cm = float(depth_res["target_dist_cm"]) if depth_res else 999.0
             cmd = depth_res["driving_command"] if depth_res else "…"
@@ -401,8 +463,9 @@ def run_vision_service(config: AppConfig):
                     ground_hazard=bool(depth_res.get("ground_hazard", False)) if depth_res else False,
                     allarme_lenti=depth_res["safety_alarm"] if depth_res else False,
                     allarme_motivo=depth_res["safety_reason"] if depth_res else "",
-                    model=("YOLOV8N" if detector else "OFF"),
-                    detections_count=len(latest.get("left_objs") or []),
+                    model=(detector.model_name if detector else "OFF"),
+                    detections_count=len(objs_now),
+                    detections=objs_now,
                     fov_blocked=bool((depth_res or {}).get("fov_blocked", False)),
                     motion=(depth_res or {}).get("motion") or {},
                     diag=diag,

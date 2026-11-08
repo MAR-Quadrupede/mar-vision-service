@@ -822,6 +822,11 @@ class StereoDepthEstimator:
         return {
             "rect_left": flip_L,
             "rect_right": flip_R,
+            # Nuvola 3D (X,Y,Z in cm, frame robot, stessa orientazione di rect_left ma a
+            # risoluzione ridotta SGBM_DIV/RECT_DIV) → usata per localizzare gli oggetti YOLO
+            "points_robot_cm": punti_robot_cm,
+            "points_scale": float(SGBM_DIV) / float(RECT_DIV),  # rect_left px / points px
+            "focal_rect_px": float(abs(self.Q[2, 3])) / float(RECT_DIV) if self.has_calibration else None,
             "composite": composite_view,
             "map_2d": mappa_navigazione,
             "eye_w": int(self.w_eye),

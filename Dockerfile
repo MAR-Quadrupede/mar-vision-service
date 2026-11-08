@@ -15,10 +15,13 @@ RUN pip install --no-cache-dir --default-timeout=1000 --extra-index-url https://
 
 COPY . .
 
+# Pesi YOLO nano inclusi nell'immagine (nessun download a runtime nel cluster)
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" && ls -la /app/yolov8n.pt
+
 ENV PYTHONUNBUFFERED=1
 ENV MQTT_BROKER=mar-mosquitto
 ENV MQTT_PORT=1883
 
-EXPOSE 8080
+EXPOSE 8443
 
 CMD ["python", "main.py", "--headless", "--depth"]
