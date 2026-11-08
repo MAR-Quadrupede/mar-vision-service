@@ -173,12 +173,13 @@ def run_vision_service(config: AppConfig):
     mqtt_client = None
     if mqtt:
         try:
+            mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="mar-vision-service")
+        except Exception:
             mqtt_client = mqtt.Client(client_id="mar-vision-service")
-            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            mqtt_client.loop_start()
-            print(f"  ✓ Connesso a MQTT Broker ({MQTT_BROKER}:{MQTT_PORT})")
-        except Exception as e:
-            print(f"  ⚠️ MQTT non disponibile ({e}). Esecuzione standalone.")
+        mqtt_client.reconnect_delay_set(min_delay=1, max_delay=10)
+        mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start()
+        print(f"  ✓ MQTT loop avviato verso {MQTT_BROKER}:{MQTT_PORT} (retry automatico)")
 
     # Force camera toward 30 FPS if config allows
     try:
