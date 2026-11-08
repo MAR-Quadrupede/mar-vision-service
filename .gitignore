@@ -1,5 +1,25 @@
+# Environment & Secrets (NEVER commit to GitHub)
+.env
+.env.*
+!.env.example
+secrets*.yaml
+*secret*.yaml
+*secret*.yml
+*secret*.json
+users_database.yml
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+
+# Python & Captures
 __pycache__/
 *.pyc
+screenshot_*.jpg
+
+# OS / IDE
 .DS_Store
 *.swp
-screenshot_*.jpg
+.vscode/
+.idea/
